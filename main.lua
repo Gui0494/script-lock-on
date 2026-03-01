@@ -83,6 +83,7 @@ local CONFIG = {
     FOVCloseDistance      = 15,         -- distância "perto"
     FOVFarDistance        = 80,         -- distância "longe"
     FOVSmoothRate        = 6,
+    FOVTransitionTime    = 0.35,        -- tempo de transição ao lock/unlock
 
     -- ▸ Aim friction (sem lock ativo)
     AimFrictionEnabled   = true,
@@ -94,6 +95,7 @@ local CONFIG = {
     IndicatorEnabled     = true,
     ShowTargetInfo       = true,
     SwitchFeedback       = true,        -- flash ao trocar alvo
+    TargetInfoOffset     = UDim2.new(0.5, 0, 0, 55),
 
     -- ▸ Teclas
     LockKey              = Enum.KeyCode.Q,
@@ -255,14 +257,24 @@ end
 -- ══════════════════════════════════════════════════════
 -- RAYCAST — filtra TODOS characters do workspace
 -- ══════════════════════════════════════════════════════
-local function GetAllCharacters()
+local FrameCache = {
+    Characters = nil,
+    FrameCount = -1,
+}
+local _frameCounter = 0
+
+local function GetAllCharactersCached()
+    if FrameCache.FrameCount == _frameCounter then
+        return FrameCache.Characters
+    end
     local chars = {}
-    -- Players
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Character then
-            table.insert(chars, p.Character)
+            chars[#chars + 1] = p.Character
         end
     end
+    FrameCache.Characters = chars
+    FrameCache.FrameCount = _frameCounter
     return chars
 end
 
@@ -272,14 +284,17 @@ local function ClearSight(fromPos, toPos, extraIgnore)
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.RespectCanCollide = true
 
-    -- Filtra TODOS characters pra acessórios não bloquearem
-    local filter = GetAllCharacters()
+    local filter = GetAllCharactersCached()
     if extraIgnore then
+        -- Copia pra não poluir o cache
+        local merged = table.clone(filter)
         for _, v in ipairs(extraIgnore) do
-            table.insert(filter, v)
+            merged[#merged + 1] = v
         end
+        params.FilterDescendantsInstances = merged
+    else
+        params.FilterDescendantsInstances = filter
     end
-    params.FilterDescendantsInstances = filter
 
     local hit = workspace:Raycast(fromPos, dir, params)
     return hit == nil
@@ -360,7 +375,16 @@ local function ScoreTarget(target)
     local dist = (State.Root.Position - root.Position).Magnitude
     if dist > CONFIG.MaxLockDistance then return math.huge end
 
-    -- Line of sight check (usa ClearSight que filtra todos characters)
+    -- PRÉ-FILTRO: Skip raycast se alvo está muito atrás da câmera
+    local camLook = Camera.CFrame.LookVector
+    local toTarget = (root.Position - State.Root.Position)
+    local dot = 0
+    if toTarget.Magnitude > 0.1 then
+        dot = camLook:Dot(toTarget.Unit)
+        if dot < -0.3 then return math.huge end  -- Atrás demais, nem testa LOS
+    end
+
+    -- SÓ ENTÃO faz o raycast (caro)
     local origin = State.Root.Position + Vector3.new(0, 1.5, 0)
     local targetPos = root.Position + Vector3.new(0, 1.5, 0)
 
@@ -372,17 +396,10 @@ local function ScoreTarget(target)
     local normDist = dist / CONFIG.MaxLockDistance
     local score = normDist
 
-    -- FRONT BONUS: alvos na frente da câmera
-    if CONFIG.PreferFrontTargets then
-        local camLook = Camera.CFrame.LookVector
-        local toTarget = (root.Position - State.Root.Position)
-        if toTarget.Magnitude > 0.1 then
-            local dot = camLook:Dot(toTarget.Unit)
-            -- dot: -1 (atrás) a 1 (frente)
-            -- Penaliza quem tá atrás
-            local frontPenalty = (1 - dot) * 0.5 * CONFIG.FrontWeight
-            score = score + frontPenalty
-        end
+    -- FRONT BONUS: alvos na frente da câmera (reutiliza dot já calculado)
+    if CONFIG.PreferFrontTargets and toTarget.Magnitude > 0.1 then
+        local frontPenalty = (1 - dot) * 0.5 * CONFIG.FrontWeight
+        score = score + frontPenalty
     end
 
     -- THREAT BONUS: quem atacou recentemente
@@ -501,6 +518,7 @@ local function UpdateWallValidation(dt)
 
     local now = tick()
     if now - State.LastWallCheck < CONFIG.WallCheckInterval then return end
+    local elapsed = now - State.LastWallCheck  -- tempo REAL desde último check
     State.LastWallCheck = now
 
     local origin = State.Root.Position + Vector3.new(0, 1.5, 0)
@@ -513,10 +531,9 @@ local function UpdateWallValidation(dt)
         State.HasLineOfSight = true
     else
         State.HasLineOfSight = false
-        State.WallLossTimer = State.WallLossTimer + (now - (State.LastWallCheck - CONFIG.WallCheckInterval))
+        State.WallLossTimer = State.WallLossTimer + elapsed
 
         if State.WallLossTimer >= CONFIG.WallLossTimeout then
-            -- Alvo atrás de parede por tempo demais
             if CONFIG.AutoSwitchOnKill then
                 local next = FindBestTarget()
                 if next and next ~= State.Target then
@@ -620,10 +637,17 @@ local function CreateIndicator(targetRoot, fadeIn)
         Instance.new("UICorner", arrow).CornerRadius = UDim.new(0, 2)
     end
 
+    -- Dead flag: para os loops quando indicator é destruído
+    bb:GetPropertyChangedSignal("Parent"):Connect(function()
+        if not bb.Parent then
+            bb:SetAttribute("_dead", true)
+        end
+    end)
+
     -- Pulse animation
     task.spawn(function()
         local expanding = false
-        while bb and bb.Parent do
+        while not bb:GetAttribute("_dead") do
             local sizeA = expanding and UDim2.new(0.95, 0, 0.95, 0) or UDim2.new(0.72, 0, 0.72, 0)
             local sizeD = expanding and UDim2.new(0.1, 0, 0.1, 0) or UDim2.new(0.06, 0, 0.06, 0)
             local ok = pcall(function()
@@ -638,7 +662,7 @@ local function CreateIndicator(targetRoot, fadeIn)
 
     -- LOS indicator: escurece quando atrás de parede
     task.spawn(function()
-        while bb and bb.Parent do
+        while not bb:GetAttribute("_dead") do
             local transparency = State.HasLineOfSight and 0.15 or 0.55
             pcall(function()
                 TweenService:Create(ring, TweenInfo.new(0.3), {BackgroundTransparency = transparency}):Play()
@@ -666,13 +690,8 @@ end
 
 -- Flash feedback ao trocar alvo
 local function FlashSwitchFeedback()
-    if not CONFIG.SwitchFeedback then return end
-    if not State.Indicator then return end
+    if not CONFIG.SwitchFeedback or not State.Indicator then return end
 
-    local ring = State.Indicator:FindFirstChild("Frame", true)
-    if not ring then return end
-
-    -- Encontra o Ring dentro do holder
     for _, child in ipairs(State.Indicator:GetDescendants()) do
         if child.Name == "Ring" and child:IsA("Frame") then
             pcall(function()
@@ -840,7 +859,7 @@ local function BuildUI()
     local infoPanel = Instance.new("Frame")
     infoPanel.Name = "TargetInfo"
     infoPanel.AnchorPoint = Vector2.new(0.5, 0)
-    infoPanel.Position = CONFIG.TargetInfoOffset or UDim2.new(0.5, 0, 0, 55)
+    infoPanel.Position = CONFIG.TargetInfoOffset
     infoPanel.Size = UDim2.new(0, 240, 0, 52)
     infoPanel.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
     infoPanel.BackgroundTransparency = 0.3
@@ -1066,7 +1085,7 @@ Unlock = function()
 
     if hadTarget then
         pcall(function()
-            TweenService:Create(Camera, TweenInfo.new(CONFIG.FOVTransitionTime or 0.35, Enum.EasingStyle.Quad), {
+            TweenService:Create(Camera, TweenInfo.new(CONFIG.FOVTransitionTime, Enum.EasingStyle.Quad), {
                 FieldOfView = State.DefaultFOV
             }):Play()
         end)
@@ -1191,10 +1210,17 @@ end
 -- ══════════════════════════════════════════════════════
 -- AIM FRICTION (sem lock) — sticky aim estilo console
 -- ══════════════════════════════════════════════════════
+local function ResetAimFriction()
+    pcall(function()
+        UserInputService.MouseDeltaSensitivity = 1
+    end)
+end
+
 local function ApplyAimFriction(dt)
-    if not CONFIG.AimFrictionEnabled then return end
-    if State.IsLocked then return end  -- friction só sem lock
-    if not State.Root then return end
+    if not CONFIG.AimFrictionEnabled or State.IsLocked or not State.Root then
+        ResetAimFriction()
+        return
+    end
 
     local vpSize = Camera.ViewportSize
     local screenCenter = Vector2.new(vpSize.X / 2, vpSize.Y / 2)
@@ -1202,7 +1228,6 @@ local function ApplyAimFriction(dt)
     local closestScreenDist = math.huge
     local frictionActive = false
 
-    -- Checa se algum inimigo tá perto do centro da tela
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and Alive(player) then
             local _, root = GetParts(player)
@@ -1222,36 +1247,20 @@ local function ApplyAimFriction(dt)
         end
     end
 
-    -- O friction é aplicado pelo InputChanged hook abaixo
-    State._aimFrictionMultiplier = 1
+    -- Aplica sensibilidade diretamente aqui (sem hook separado)
     if frictionActive then
         local proximity = 1 - (closestScreenDist / CONFIG.AimFrictionRadius)
-        State._aimFrictionMultiplier = 1 - (proximity * CONFIG.AimFrictionStrength)
-    end
-end
-
--- Hook no input da câmera pra aplicar friction
-Conn("AimFriction", UserInputService.InputChanged:Connect(function(input)
-    if State.IsLocked then return end
-    if not CONFIG.AimFrictionEnabled then return end
-
-    if input.UserInputType == Enum.UserInputType.MouseMovement then
-        -- Não podemos modificar o input diretamente, mas podemos
-        -- compensar via CameraOffset ou UserInputService.MouseDeltaSensitivity
-        -- Approach: ajustar MouseDeltaSensitivity
-        local mult = State._aimFrictionMultiplier or 1
+        local mult = 1 - (proximity * CONFIG.AimFrictionStrength)
         pcall(function()
             UserInputService.MouseDeltaSensitivity = mult
         end)
+    else
+        ResetAimFriction()
     end
-end))
-
--- Restaura sensibilidade quando não tem friction
-local function ResetAimFriction()
-    pcall(function()
-        UserInputService.MouseDeltaSensitivity = 1
-    end)
 end
+
+-- Safety net: garante reset se o script crashar
+game:BindToClose(ResetAimFriction)
 
 -- ══════════════════════════════════════════════════════
 -- AUTO-LOCK HIT DETECTION
@@ -1376,11 +1385,12 @@ end))
 -- MAIN CAMERA LOOP — framerate independent
 -- ══════════════════════════════════════════════════════
 local function UpdateCamera(dt)
+    _frameCounter = _frameCounter + 1
+
     -- Aim friction (roda sempre, mesmo sem lock)
     ApplyAimFriction(dt)
 
     if not State.IsLocked or not State.Target then
-        ResetAimFriction()
         return
     end
     if not State.Root then return end
@@ -1431,7 +1441,7 @@ local function UpdateCamera(dt)
 
     -- SPHERE CAST anti-wall (4 raycasts)
     local wallCheckOrigin = playerPos + Vector3.new(0, 2, 0)
-    local ignoreChars = GetAllCharacters()
+    local ignoreChars = GetAllCharactersCached()
 
     local wallHit = SphereCast(wallCheckOrigin, camGoal, 0.5, ignoreChars)
     if wallHit then
@@ -1469,6 +1479,8 @@ end
 -- CHARACTER SETUP
 -- ══════════════════════════════════════════════════════
 local function OnCharacter(char)
+    ResetAimFriction()  -- SEMPRE reseta ao respawn
+
     State.Char = char
     State.Hum = char:WaitForChild("Humanoid", 10)
     State.Root = char:WaitForChild("HumanoidRootPart", 10)
