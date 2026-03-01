@@ -1,290 +1,689 @@
 --[[
-    ╔══════════════════════════════════════════════════╗
-    ║        LOCK-ON TARGET SYSTEM v2.0                ║
-    ║        Mobile + PC | Console Style               ║
-    ║        Bug-free & Production Ready               ║
-    ╚══════════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════╗
+    ║        LOCK-ON TARGET SYSTEM v4.0 — CONSOLE GRADE        ║
+    ║        Predictive • Aim Friction • Orbital • Threat AI   ║
+    ║        Mobile + PC + Gamepad | Framerate Independent      ║
+    ╚══════════════════════════════════════════════════════════════╝
     
-    LocalScript — StarterPlayerScripts
+    LocalScript → StarterPlayerScripts
     
     CONTROLES:
-      PC:     Q = Lock/Unlock  |  E = Próximo alvo  |  R = Alvo anterior
-      Mobile: Botão na tela    |  ◀ ▶ ou Swipe horizontal
+      PC:      Q = Lock/Unlock  |  E = Próximo  |  R = Anterior
+               Mouse move = orbital adjust (quando locked)
+      Mobile:  Botão arrastável |  ◀ ▶ Trocar alvo  |  Swipe
+      Gamepad: RB = Lock  |  Right Stick = Orbital  |  RS Click = Cycle
     
-    FEATURES:
-      • Auto-lock ao bater em alguém
-      • Destrava ao alvo morrer / sair do range
-      • HP bar em tempo real
-      • Indicador 3D animado
-      • Trocar entre alvos
-      • Compatível Mobile + PC + Gamepad
-      • Camera suave estilo Souls/Zelda
+    v4 CHANGELOG:
+      ✦ FIX: Lerp framerate-independent (exponential decay)
+      ✦ FIX: Prediction alpha clamped corretamente
+      ✦ FIX: TargetCharRemoved memory leak
+      ✦ FIX: ClearSight filtra TODOS characters
+      ✦ NEW: Target validation timer (2.5s behind wall before unlock)
+      ✦ NEW: Aim friction / sticky aim (sem lock)
+      ✦ NEW: FOV dinâmico por distância
+      ✦ NEW: Sphere cast (4 raycasts offset) anti-wall
+      ✦ NEW: Câmera orbital real com mouse/stick
+      ✦ NEW: Feedback visual de troca (fade + pulse)
+      ✦ NEW: Threat scoring (attacking > low hp > approaching)
+      ✦ NEW: Swipe timeout (300ms max)
+      ✦ NEW: Cached target parts (1 lookup per frame)
 --]]
 
 -- ══════════════════════════════════════════════════════
 -- SERVICES
 -- ══════════════════════════════════════════════════════
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService     = game:GetService("TweenService")
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local TweenService       = game:GetService("TweenService")
 
 local Camera       = workspace.CurrentCamera
 local LocalPlayer  = Players.LocalPlayer
 local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ══════════════════════════════════════════════════════
--- CONFIGURAÇÕES (edite aqui)
+-- CONFIG
 -- ══════════════════════════════════════════════════════
 local CONFIG = {
-    -- Gameplay
-    MaxLockDistance       = 120,
-    LockSmoothness       = 0.2,
-    CameraOffset         = Vector3.new(0, 4, 14),
-    HeightOffset         = Vector3.new(0, 2, 0),
+    -- ▸ Targeting
+    MaxLockDistance       = 150,
     AutoLockOnHit        = true,
-    BreakLockOnDeath     = true,
+    AutoSwitchOnKill     = true,
 
-    -- Teclas PC
+    -- ▸ Target scoring weights
+    PreferFrontTargets   = true,
+    FrontWeight          = 0.5,         -- bonus pra quem tá na frente
+    ThreatWeight         = 0.3,         -- bonus pra quem tá te atacando/vindo
+    LowHPWeight          = 0.15,        -- bonus pra quem tá com pouca vida
+    ApproachWeight       = 0.25,        -- bonus pra quem tá vindo na sua direção
+
+    -- ▸ Wall validation
+    WallLossTimeout      = 2.5,         -- segundos atrás de parede antes de unlock
+    WallCheckInterval    = 0.15,        -- intervalo entre checks de parede
+
+    -- ▸ Câmera (framerate independent)
+    CamSmoothRate        = 12,          -- taxa de suavização (units/sec, exponential)
+    PredictionRate       = 8,           -- taxa de suavização da predição
+    VelocitySmoothRate   = 5,           -- taxa de suavização da velocidade
+    PredictionStrength   = 0.4,         -- quanto antecipar o movimento
+    AimLeadFactor        = 0.22,        -- mira à frente do alvo
+
+    -- ▸ Câmera orbital
+    CameraDistance       = 14,
+    CameraHeight         = 4.5,
+    LookAtBias           = 0.6,         -- 0=player, 1=alvo
+    OrbitalEnabled       = true,
+    OrbitalSpeed         = 0.003,       -- sensibilidade mouse/stick
+    OrbitalMaxAngle      = math.rad(50),-- máximo desvio lateral
+    OrbitalDecayRate     = 3,           -- volta pro centro (units/sec)
+
+    -- ▸ FOV dinâmico
+    FOVClose             = 62,          -- FOV quando alvo perto
+    FOVFar               = 48,          -- FOV quando alvo longe
+    FOVCloseDistance      = 15,         -- distância "perto"
+    FOVFarDistance        = 80,         -- distância "longe"
+    FOVSmoothRate        = 6,
+
+    -- ▸ Aim friction (sem lock ativo)
+    AimFrictionEnabled   = true,
+    AimFrictionRadius    = 60,          -- pixels do centro da tela
+    AimFrictionStrength  = 0.45,        -- 0=sem efeito, 1=para totalmente
+    AimFrictionRange     = 80,          -- studs máximo pro friction funcionar
+
+    -- ▸ Visual
+    IndicatorEnabled     = true,
+    ShowTargetInfo       = true,
+    SwitchFeedback       = true,        -- flash ao trocar alvo
+
+    -- ▸ Teclas
     LockKey              = Enum.KeyCode.Q,
     NextTargetKey        = Enum.KeyCode.E,
     PrevTargetKey        = Enum.KeyCode.R,
+    GamepadLock          = Enum.KeyCode.ButtonR1,
+    GamepadNext          = Enum.KeyCode.ButtonR3,
 
-    -- Visual
-    IndicatorEnabled     = true,
-    ShowTargetInfo       = true,
-    FOVLocked            = 55,
-    FOVTransitionSpeed   = 0.15,
-
-    -- Mobile
-    ButtonSize           = 65,
-    SwipeThreshold       = 60,
+    -- ▸ Mobile
+    ButtonSize           = 62,
+    DefaultButtonPos     = UDim2.new(1, -85, 0.35, 0),
+    SwipeThreshold       = 55,
+    SwipeTimeout         = 0.3,         -- segundos máximo pra swipe contar
+    DragThreshold        = 8,
 }
 
 -- ══════════════════════════════════════════════════════
--- ESTADO
+-- STATE
 -- ══════════════════════════════════════════════════════
 local State = {
-    LockedTarget   = nil,
-    IsLocked       = false,
-    Character      = nil,
-    Humanoid       = nil,
-    RootPart       = nil,
-    DefaultFOV     = Camera.FieldOfView,
-    Connections    = {},   -- armazena todas as connections pra cleanup
-    Indicator      = nil,
-    TouchStart     = nil,
+    Target          = nil,           -- Player ou Model
+    IsLocked        = false,
+    Char            = nil,
+    Hum             = nil,
+    Root            = nil,
+    DefaultFOV      = Camera.FieldOfView,
+    CurrentFOV      = Camera.FieldOfView,
+    Conns           = {},
+    Indicator       = nil,
+
+    -- Cache (atualizado 1x por frame)
+    CachedTargetRoot = nil,
+    CachedTargetHum  = nil,
+    CachedTargetChar = nil,
+
+    -- Predição (framerate independent)
+    TargetVelocity      = Vector3.zero,
+    SmoothedPrediction  = Vector3.zero,
+    LastTargetPos       = nil,
+    LastPredictionTime  = 0,
+
+    -- Wall validation
+    WallLossTimer       = 0,
+    HasLineOfSight      = true,
+    LastWallCheck       = 0,
+
+    -- Câmera orbital
+    OrbitalOffset       = 0,           -- ângulo lateral em radianos
+
+    -- Mobile
+    TouchStart      = nil,
+    TouchStartTime  = 0,
+    ButtonDragging  = false,
+    SavedButtonPos  = nil,
+
+    -- Aim friction
+    LastCameraInput = Vector2.zero,
+
+    -- Threat tracking: quem bateu no player recentemente
+    RecentAttackers = {},   -- {[Player/Model] = timestamp}
 }
 
 -- ══════════════════════════════════════════════════════
--- UTILIDADES
+-- MATH HELPERS
 -- ══════════════════════════════════════════════════════
-local function SafeDisconnect(key)
-    if State.Connections[key] then
-        State.Connections[key]:Disconnect()
-        State.Connections[key] = nil
+
+-- Exponential decay lerp: framerate independent
+-- Retorna alpha pra usar em :Lerp()
+-- rate = velocidade (maior = mais rápido), dt = delta time
+local function ExpDecay(rate, dt)
+    return 1 - math.exp(-rate * dt)
+end
+
+-- Clamp lerp alpha pra segurança
+local function SafeLerp(a, b, alpha)
+    alpha = math.clamp(alpha, 0, 1)
+    if typeof(a) == "Vector3" then
+        return a:Lerp(b, alpha)
+    elseif typeof(a) == "CFrame" then
+        return a:Lerp(b, alpha)
+    elseif typeof(a) == "number" then
+        return a + (b - a) * alpha
+    end
+    return b
+end
+
+-- ══════════════════════════════════════════════════════
+-- CONNECTION MANAGER (zero leaks)
+-- ══════════════════════════════════════════════════════
+local function Conn(key, connection)
+    if State.Conns[key] and typeof(State.Conns[key]) == "RBXScriptConnection" then
+        State.Conns[key]:Disconnect()
+    end
+    State.Conns[key] = connection
+end
+
+local function Disconn(key)
+    if State.Conns[key] then
+        if typeof(State.Conns[key]) == "RBXScriptConnection" then
+            State.Conns[key]:Disconnect()
+        end
+        State.Conns[key] = nil
     end
 end
 
-local function DisconnectAll()
-    for key, conn in pairs(State.Connections) do
-        if typeof(conn) == "RBXScriptConnection" then
-            conn:Disconnect()
+local function DisconnGroup(prefix)
+    local toRemove = {}
+    for k, v in pairs(State.Conns) do
+        if type(k) == "string" and k:sub(1, #prefix) == prefix then
+            if typeof(v) == "RBXScriptConnection" then
+                v:Disconnect()
+            end
+            table.insert(toRemove, k)
         end
     end
-    State.Connections = {}
+    for _, k in ipairs(toRemove) do
+        State.Conns[k] = nil
+    end
 end
 
-local function GetCharacterParts(player)
-    local char = player and player.Character
-    if not char then return nil, nil, nil end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    return char, root, hum
+-- ══════════════════════════════════════════════════════
+-- TARGET PARTS — cached per frame
+-- ══════════════════════════════════════════════════════
+
+-- Pega parts de um Player
+local function GetParts(target)
+    if not target then return nil, nil, nil end
+    if typeof(target) == "Instance" and target:IsA("Player") then
+        local c = target.Character
+        if not c then return nil, nil, nil end
+        return c, c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
+    end
+    return nil, nil, nil
 end
 
-local function IsAlive(player)
-    local _, _, hum = GetCharacterParts(player)
-    return hum and hum.Health > 0
+-- Atualiza cache 1x por frame
+local function RefreshTargetCache()
+    if not State.Target then
+        State.CachedTargetChar = nil
+        State.CachedTargetRoot = nil
+        State.CachedTargetHum = nil
+        return
+    end
+    State.CachedTargetChar, State.CachedTargetRoot, State.CachedTargetHum = GetParts(State.Target)
 end
 
-local function DistanceTo(player)
-    if not State.RootPart then return math.huge end
-    local _, root = GetCharacterParts(player)
-    if not root then return math.huge end
-    return (State.RootPart.Position - root.Position).Magnitude
+local function Alive(target)
+    local _, _, h = GetParts(target)
+    return h ~= nil and h.Health > 0
 end
 
-local function HasLineOfSight(targetRoot)
-    if not State.RootPart or not targetRoot then return false end
+local function Dist(target)
+    if not State.Root then return math.huge end
+    local _, r = GetParts(target)
+    if not r then return math.huge end
+    return (State.Root.Position - r.Position).Magnitude
+end
 
-    local origin = State.RootPart.Position + Vector3.new(0, 1, 0)
-    local direction = targetRoot.Position - origin
+-- ══════════════════════════════════════════════════════
+-- RAYCAST — filtra TODOS characters do workspace
+-- ══════════════════════════════════════════════════════
+local function GetAllCharacters()
+    local chars = {}
+    -- Players
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then
+            table.insert(chars, p.Character)
+        end
+    end
+    return chars
+end
+
+local function ClearSight(fromPos, toPos, extraIgnore)
+    local dir = toPos - fromPos
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.RespectCanCollide = true
+
+    -- Filtra TODOS characters pra acessórios não bloquearem
+    local filter = GetAllCharacters()
+    if extraIgnore then
+        for _, v in ipairs(extraIgnore) do
+            table.insert(filter, v)
+        end
+    end
+    params.FilterDescendantsInstances = filter
+
+    local hit = workspace:Raycast(fromPos, dir, params)
+    return hit == nil
+end
+
+-- Sphere cast simulado: 4 raycasts com offset
+local function SphereCast(origin, target, radius, ignoreList)
+    local dir = target - origin
+    if dir.Magnitude < 0.1 then return true end
+
+    local forward = dir.Unit
+    local right = forward:Cross(Vector3.new(0, 1, 0))
+    if right.Magnitude < 0.01 then
+        right = forward:Cross(Vector3.new(1, 0, 0))
+    end
+    right = right.Unit
+    local up = right:Cross(forward).Unit
+
+    local offsets = {
+        Vector3.zero,               -- centro
+        right * radius,             -- direita
+        -right * radius,            -- esquerda
+        up * radius,                -- cima
+    }
 
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {State.Character, targetRoot.Parent}
+    params.FilterDescendantsInstances = ignoreList or {}
+    params.RespectCanCollide = true
 
-    local result = workspace:Raycast(origin, direction, params)
-    return result == nil -- nil = nada bloqueando
-end
+    local bestHit = nil
+    local bestDist = math.huge
 
--- ══════════════════════════════════════════════════════
--- BUSCA DE ALVOS
--- ══════════════════════════════════════════════════════
-local function GetValidTargets()
-    local targets = {}
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and IsAlive(player) then
-            local dist = DistanceTo(player)
-            if dist <= CONFIG.MaxLockDistance then
-                local _, root = GetCharacterParts(player)
-                if root and HasLineOfSight(root) then
-                    table.insert(targets, {
-                        Player = player,
-                        Distance = dist,
-                    })
-                end
+    for _, offset in ipairs(offsets) do
+        local from = origin + offset
+        local to = target + offset
+        local result = workspace:Raycast(from, to - from, params)
+        if result then
+            local d = (result.Position - from).Magnitude
+            if d < bestDist then
+                bestDist = d
+                bestHit = result
             end
         end
     end
-    table.sort(targets, function(a, b) return a.Distance < b.Distance end)
+
+    return bestHit -- nil = clear, hit = blocked
+end
+
+-- ══════════════════════════════════════════════════════
+-- THREAT SCORING — prioriza alvos inteligentemente
+-- ══════════════════════════════════════════════════════
+
+-- Registra quem atacou o player (chamado pelo hit detection)
+local function RegisterAttacker(attacker)
+    State.RecentAttackers[attacker] = tick()
+end
+
+-- Limpa atacantes antigos (>5s)
+local function CleanAttackers()
+    local now = tick()
+    local toRemove = {}
+    for k, t in pairs(State.RecentAttackers) do
+        if now - t > 5 then
+            table.insert(toRemove, k)
+        end
+    end
+    for _, k in ipairs(toRemove) do
+        State.RecentAttackers[k] = nil
+    end
+end
+
+local function ScoreTarget(target)
+    local _, root, hum = GetParts(target)
+    if not root or not hum or not State.Root then return math.huge end
+    if hum.Health <= 0 then return math.huge end
+
+    local dist = (State.Root.Position - root.Position).Magnitude
+    if dist > CONFIG.MaxLockDistance then return math.huge end
+
+    -- Line of sight check (usa ClearSight que filtra todos characters)
+    local origin = State.Root.Position + Vector3.new(0, 1.5, 0)
+    local targetPos = root.Position + Vector3.new(0, 1.5, 0)
+
+    if not ClearSight(origin, targetPos) then
+        return math.huge
+    end
+
+    -- Score base = distância normalizada (0-1)
+    local normDist = dist / CONFIG.MaxLockDistance
+    local score = normDist
+
+    -- FRONT BONUS: alvos na frente da câmera
+    if CONFIG.PreferFrontTargets then
+        local camLook = Camera.CFrame.LookVector
+        local toTarget = (root.Position - State.Root.Position)
+        if toTarget.Magnitude > 0.1 then
+            local dot = camLook:Dot(toTarget.Unit)
+            -- dot: -1 (atrás) a 1 (frente)
+            -- Penaliza quem tá atrás
+            local frontPenalty = (1 - dot) * 0.5 * CONFIG.FrontWeight
+            score = score + frontPenalty
+        end
+    end
+
+    -- THREAT BONUS: quem atacou recentemente
+    local attackTime = State.RecentAttackers[target]
+    if attackTime then
+        local recency = math.clamp(1 - (tick() - attackTime) / 5, 0, 1)
+        score = score - recency * CONFIG.ThreatWeight
+    end
+
+    -- LOW HP BONUS: prioriza quem tá quase morrendo
+    local hpPct = hum.Health / hum.MaxHealth
+    if hpPct < 0.4 then
+        score = score - (1 - hpPct) * CONFIG.LowHPWeight
+    end
+
+    -- APPROACH BONUS: quem tá vindo na sua direção
+    local rootVel = root.AssemblyLinearVelocity
+    if rootVel and rootVel.Magnitude > 1 then
+        local toPlayer = (State.Root.Position - root.Position)
+        if toPlayer.Magnitude > 0.1 then
+            local approachDot = rootVel.Unit:Dot(toPlayer.Unit)
+            if approachDot > 0.3 then
+                score = score - approachDot * CONFIG.ApproachWeight
+            end
+        end
+    end
+
+    return score
+end
+
+local function GetScoredTargets()
+    CleanAttackers()
+
+    local targets = {}
+
+    -- Players
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and Alive(player) then
+            local s = ScoreTarget(player)
+            if s < math.huge then
+                table.insert(targets, {Target = player, Score = s, Distance = Dist(player)})
+            end
+        end
+    end
+
+    table.sort(targets, function(a, b) return a.Score < b.Score end)
     return targets
 end
 
-local function FindNearest()
-    local targets = GetValidTargets()
-    return targets[1] and targets[1].Player or nil
-end
-
-local function GetTargetIndex(targets, target)
-    for i, t in ipairs(targets) do
-        if t.Player == target then return i end
-    end
-    return 0
-end
-
-local function CycleTarget(direction)
-    if not State.IsLocked then return end
-    local targets = GetValidTargets()
-    if #targets <= 1 then return end
-
-    local idx = GetTargetIndex(targets, State.LockedTarget)
-    idx = idx + direction
-    if idx < 1 then idx = #targets end
-    if idx > #targets then idx = 1 end
-
-    -- Chama LockOn declarado abaixo via forward reference
-    _G._LockOnFn(targets[idx].Player)
+local function FindBestTarget()
+    local t = GetScoredTargets()
+    return t[1] and t[1].Target or nil
 end
 
 -- ══════════════════════════════════════════════════════
--- INDICADOR 3D
+-- VELOCITY PREDICTION — framerate independent
+-- ══════════════════════════════════════════════════════
+local function UpdatePrediction(dt)
+    if not State.CachedTargetRoot then
+        State.TargetVelocity = Vector3.zero
+        State.SmoothedPrediction = Vector3.zero
+        State.LastTargetPos = nil
+        return
+    end
+
+    local currentPos = State.CachedTargetRoot.Position
+    local now = tick()
+
+    if State.LastTargetPos then
+        local timeDelta = now - State.LastPredictionTime
+        if timeDelta > 0.001 then
+            -- Velocidade instantânea
+            local instantVel = (currentPos - State.LastTargetPos) / timeDelta
+
+            -- Suaviza velocidade com exponential decay
+            local velAlpha = ExpDecay(CONFIG.VelocitySmoothRate, dt)
+            State.TargetVelocity = SafeLerp(State.TargetVelocity, instantVel, velAlpha)
+
+            -- Posição predita
+            local predicted = currentPos + State.TargetVelocity * CONFIG.PredictionStrength
+
+            -- Suaviza predição com exponential decay
+            local predAlpha = ExpDecay(CONFIG.PredictionRate, dt)
+            State.SmoothedPrediction = SafeLerp(State.SmoothedPrediction, predicted, predAlpha)
+        end
+    else
+        State.SmoothedPrediction = currentPos
+    end
+
+    State.LastTargetPos = currentPos
+    State.LastPredictionTime = now
+end
+
+local function GetPredictedTargetPos()
+    if not State.CachedTargetRoot then return Vector3.zero end
+
+    local basePos = State.CachedTargetRoot.Position + Vector3.new(0, 2, 0)
+
+    if State.SmoothedPrediction.Magnitude > 0 then
+        local predicted = State.SmoothedPrediction + Vector3.new(0, 2, 0)
+        return basePos:Lerp(predicted, CONFIG.AimLeadFactor)
+    end
+
+    return basePos
+end
+
+-- ══════════════════════════════════════════════════════
+-- WALL VALIDATION — timer antes de unlock
+-- ══════════════════════════════════════════════════════
+local function UpdateWallValidation(dt)
+    if not State.IsLocked or not State.CachedTargetRoot or not State.Root then
+        State.WallLossTimer = 0
+        State.HasLineOfSight = true
+        return
+    end
+
+    local now = tick()
+    if now - State.LastWallCheck < CONFIG.WallCheckInterval then return end
+    State.LastWallCheck = now
+
+    local origin = State.Root.Position + Vector3.new(0, 1.5, 0)
+    local target = State.CachedTargetRoot.Position + Vector3.new(0, 1.5, 0)
+
+    local hasLOS = ClearSight(origin, target)
+
+    if hasLOS then
+        State.WallLossTimer = 0
+        State.HasLineOfSight = true
+    else
+        State.HasLineOfSight = false
+        State.WallLossTimer = State.WallLossTimer + (now - (State.LastWallCheck - CONFIG.WallCheckInterval))
+
+        if State.WallLossTimer >= CONFIG.WallLossTimeout then
+            -- Alvo atrás de parede por tempo demais
+            if CONFIG.AutoSwitchOnKill then
+                local next = FindBestTarget()
+                if next and next ~= State.Target then
+                    LockOn(next)
+                else
+                    Unlock()
+                end
+            else
+                Unlock()
+            end
+        end
+    end
+end
+
+-- ══════════════════════════════════════════════════════
+-- 3D INDICATOR
 -- ══════════════════════════════════════════════════════
 local function DestroyIndicator()
     if State.Indicator then
-        State.Indicator:Destroy()
+        pcall(function() State.Indicator:Destroy() end)
         State.Indicator = nil
     end
 end
 
-local function CreateIndicator(targetRoot)
+local function CreateIndicator(targetRoot, fadeIn)
     DestroyIndicator()
     if not CONFIG.IndicatorEnabled or not targetRoot then return end
 
     local bb = Instance.new("BillboardGui")
-    bb.Name = "LockOnIndicator"
-    bb.Size = UDim2.new(2.8, 0, 2.8, 0)
+    bb.Name = "LockIndicator"
+    bb.Size = UDim2.new(3, 0, 3, 0)
     bb.AlwaysOnTop = true
     bb.LightInfluence = 0
     bb.StudsOffset = Vector3.new(0, 0.5, 0)
+    bb.MaxDistance = CONFIG.MaxLockDistance * 2
 
     local holder = Instance.new("Frame")
     holder.Size = UDim2.new(1, 0, 1, 0)
     holder.BackgroundTransparency = 1
     holder.Parent = bb
 
-    -- Anel externo
+    -- Ring
     local ring = Instance.new("Frame")
     ring.Name = "Ring"
     ring.AnchorPoint = Vector2.new(0.5, 0.5)
     ring.Position = UDim2.new(0.5, 0, 0.5, 0)
-    ring.Size = UDim2.new(0.55, 0, 0.55, 0)
-    ring.BackgroundColor3 = Color3.fromRGB(255, 40, 40)
-    ring.BackgroundTransparency = 0.25
+    ring.Size = UDim2.new(0.5, 0, 0.5, 0)
+    ring.BackgroundColor3 = Color3.fromRGB(255, 35, 35)
+    ring.BackgroundTransparency = 0.15
     ring.BorderSizePixel = 0
     ring.Parent = holder
     Instance.new("UICorner", ring).CornerRadius = UDim.new(1, 0)
 
-    -- Buraco interno
     local hole = Instance.new("Frame")
     hole.AnchorPoint = Vector2.new(0.5, 0.5)
     hole.Position = UDim2.new(0.5, 0, 0.5, 0)
-    hole.Size = UDim2.new(0.65, 0, 0.65, 0)
+    hole.Size = UDim2.new(0.6, 0, 0.6, 0)
     hole.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    hole.BackgroundTransparency = 0.75
+    hole.BackgroundTransparency = 0.82
     hole.BorderSizePixel = 0
     hole.Parent = ring
     Instance.new("UICorner", hole).CornerRadius = UDim.new(1, 0)
 
-    -- Ponto central
+    -- Dot
     local dot = Instance.new("Frame")
+    dot.Name = "Dot"
     dot.AnchorPoint = Vector2.new(0.5, 0.5)
     dot.Position = UDim2.new(0.5, 0, 0.5, 0)
-    dot.Size = UDim2.new(0.12, 0, 0.12, 0)
-    dot.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+    dot.Size = UDim2.new(0.08, 0, 0.08, 0)
+    dot.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
     dot.BorderSizePixel = 0
     dot.Parent = holder
     Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
-    -- 4 traços girantes
-    local spinner = Instance.new("Frame")
-    spinner.Name = "Spinner"
-    spinner.AnchorPoint = Vector2.new(0.5, 0.5)
-    spinner.Position = UDim2.new(0.5, 0, 0.5, 0)
-    spinner.Size = UDim2.new(0.85, 0, 0.85, 0)
-    spinner.BackgroundTransparency = 1
-    spinner.Rotation = 0
-    spinner.Parent = holder
+    -- 4 setas
+    local arrowHolder = Instance.new("Frame")
+    arrowHolder.Name = "Arrows"
+    arrowHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+    arrowHolder.Position = UDim2.new(0.5, 0, 0.5, 0)
+    arrowHolder.Size = UDim2.new(0.85, 0, 0.85, 0)
+    arrowHolder.BackgroundTransparency = 1
+    arrowHolder.Parent = holder
 
-    for i = 0, 3 do
-        local tick = Instance.new("Frame")
-        tick.AnchorPoint = Vector2.new(0.5, 0)
-        tick.Position = UDim2.new(0.5, 0, 0, 0)
-        tick.Size = UDim2.new(0.06, 0, 0.2, 0)
-        tick.Rotation = i * 90
-        tick.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
-        tick.BackgroundTransparency = 0.35
-        tick.BorderSizePixel = 0
-        tick.Parent = spinner
-        Instance.new("UICorner", tick).CornerRadius = UDim.new(0, 2)
+    local arrowData = {
+        {pos = UDim2.new(0.5, 0, 0, 0),  rot = 0},
+        {pos = UDim2.new(1, 0, 0.5, 0),  rot = 90},
+        {pos = UDim2.new(0.5, 0, 1, 0),  rot = 180},
+        {pos = UDim2.new(0, 0, 0.5, 0),  rot = 270},
+    }
+
+    for _, d in ipairs(arrowData) do
+        local arrow = Instance.new("Frame")
+        arrow.AnchorPoint = Vector2.new(0.5, 0)
+        arrow.Position = d.pos
+        arrow.Size = UDim2.new(0.04, 0, 0.15, 0)
+        arrow.Rotation = d.rot
+        arrow.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+        arrow.BackgroundTransparency = 0.2
+        arrow.BorderSizePixel = 0
+        arrow.Parent = arrowHolder
+        Instance.new("UICorner", arrow).CornerRadius = UDim.new(0, 2)
     end
 
-    -- Animação segura
+    -- Pulse animation
     task.spawn(function()
+        local expanding = false
         while bb and bb.Parent do
-            local ok, tween = pcall(function()
-                return TweenService:Create(
-                    spinner,
-                    TweenInfo.new(3, Enum.EasingStyle.Linear),
-                    {Rotation = spinner.Rotation + 360}
-                )
+            local sizeA = expanding and UDim2.new(0.95, 0, 0.95, 0) or UDim2.new(0.72, 0, 0.72, 0)
+            local sizeD = expanding and UDim2.new(0.1, 0, 0.1, 0) or UDim2.new(0.06, 0, 0.06, 0)
+            local ok = pcall(function()
+                TweenService:Create(arrowHolder, TweenInfo.new(0.65, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Size = sizeA}):Play()
+                TweenService:Create(dot, TweenInfo.new(0.65, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Size = sizeD}):Play()
             end)
             if not ok then break end
-            tween:Play()
-            tween.Completed:Wait()
+            expanding = not expanding
+            task.wait(0.65)
         end
     end)
 
-    -- Animação de escala de entrada
-    ring.Size = UDim2.new(0.9, 0, 0.9, 0)
-    TweenService:Create(ring, TweenInfo.new(0.3, Enum.EasingStyle.Back), {
-        Size = UDim2.new(0.55, 0, 0.55, 0)
-    }):Play()
+    -- LOS indicator: escurece quando atrás de parede
+    task.spawn(function()
+        while bb and bb.Parent do
+            local transparency = State.HasLineOfSight and 0.15 or 0.55
+            pcall(function()
+                TweenService:Create(ring, TweenInfo.new(0.3), {BackgroundTransparency = transparency}):Play()
+            end)
+            task.wait(0.2)
+        end
+    end)
+
+    -- Fade-in na troca
+    if fadeIn then
+        ring.Size = UDim2.new(0.9, 0, 0.9, 0)
+        ring.BackgroundTransparency = 0.9
+        pcall(function()
+            TweenService:Create(ring, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                Size = UDim2.new(0.5, 0, 0.5, 0),
+                BackgroundTransparency = 0.15,
+            }):Play()
+        end)
+    end
 
     bb.Adornee = targetRoot
     bb.Parent = targetRoot
     State.Indicator = bb
+end
+
+-- Flash feedback ao trocar alvo
+local function FlashSwitchFeedback()
+    if not CONFIG.SwitchFeedback then return end
+    if not State.Indicator then return end
+
+    local ring = State.Indicator:FindFirstChild("Frame", true)
+    if not ring then return end
+
+    -- Encontra o Ring dentro do holder
+    for _, child in ipairs(State.Indicator:GetDescendants()) do
+        if child.Name == "Ring" and child:IsA("Frame") then
+            pcall(function()
+                child.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+                TweenService:Create(child, TweenInfo.new(0.3), {
+                    BackgroundColor3 = Color3.fromRGB(255, 35, 35)
+                }):Play()
+            end)
+            break
+        end
+    end
 end
 
 -- ══════════════════════════════════════════════════════
@@ -293,122 +692,196 @@ end
 local UI = {}
 
 local function BuildUI()
-    -- Limpa UI anterior se existir
-    local old = PlayerGui:FindFirstChild("LockOnUI")
+    local old = PlayerGui:FindFirstChild("LockOnUI_v4")
     if old then old:Destroy() end
 
     local screen = Instance.new("ScreenGui")
-    screen.Name = "LockOnUI"
+    screen.Name = "LockOnUI_v4"
     screen.ResetOnSpawn = false
     screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screen.DisplayOrder = 10
     screen.Parent = PlayerGui
 
-    -- ═══ CONTAINER DOS BOTÕES ═══
-    local btnContainer = Instance.new("Frame")
-    btnContainer.Name = "Buttons"
-    btnContainer.Size = UDim2.new(0, 180, 0, 130)
-    btnContainer.Position = UDim2.new(1, -190, 0.55, 0)
-    btnContainer.BackgroundTransparency = 1
-    btnContainer.Parent = screen
+    -- ═══ DRAGGABLE BUTTON CONTAINER ═══
+    local btnFrame = Instance.new("Frame")
+    btnFrame.Name = "DragContainer"
+    btnFrame.Size = UDim2.new(0, CONFIG.ButtonSize + 10, 0, CONFIG.ButtonSize + 70)
+    btnFrame.Position = State.SavedButtonPos or CONFIG.DefaultButtonPos
+    btnFrame.BackgroundTransparency = 1
+    btnFrame.Active = true
+    btnFrame.Parent = screen
 
-    -- Botão principal LOCK
     local lockBtn = Instance.new("TextButton")
     lockBtn.Name = "LockBtn"
-    lockBtn.AnchorPoint = Vector2.new(0.5, 0.5)
-    lockBtn.Position = UDim2.new(0.5, 0, 0.4, 0)
+    lockBtn.AnchorPoint = Vector2.new(0.5, 0)
+    lockBtn.Position = UDim2.new(0.5, 0, 0, 0)
     lockBtn.Size = UDim2.new(0, CONFIG.ButtonSize, 0, CONFIG.ButtonSize)
-    lockBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    lockBtn.BackgroundTransparency = 0.2
+    lockBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    lockBtn.BackgroundTransparency = 0.15
     lockBtn.BorderSizePixel = 0
     lockBtn.Text = "⊕"
-    lockBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    lockBtn.TextColor3 = Color3.fromRGB(190, 190, 200)
     lockBtn.TextScaled = true
     lockBtn.Font = Enum.Font.GothamBold
     lockBtn.AutoButtonColor = false
-    lockBtn.Parent = btnContainer
+    lockBtn.Parent = btnFrame
     Instance.new("UICorner", lockBtn).CornerRadius = UDim.new(1, 0)
 
-    local lockStroke = Instance.new("UIStroke")
-    lockStroke.Color = Color3.fromRGB(150, 150, 160)
-    lockStroke.Thickness = 2.5
-    lockStroke.Parent = lockBtn
+    local btnStroke = Instance.new("UIStroke")
+    btnStroke.Color = Color3.fromRGB(130, 130, 145)
+    btnStroke.Thickness = 2
+    btnStroke.Parent = lockBtn
 
-    -- Label
+    local btnGlow = Instance.new("UIStroke")
+    btnGlow.Name = "Glow"
+    btnGlow.Color = Color3.fromRGB(255, 50, 50)
+    btnGlow.Thickness = 0
+    btnGlow.Transparency = 0.6
+    btnGlow.Parent = lockBtn
+
     local lockLbl = Instance.new("TextLabel")
     lockLbl.Name = "Label"
     lockLbl.AnchorPoint = Vector2.new(0.5, 0)
-    lockLbl.Position = UDim2.new(0.5, 0, 1, 4)
-    lockLbl.Size = UDim2.new(0, 60, 0, 16)
+    lockLbl.Position = UDim2.new(0.5, 0, 1, 3)
+    lockLbl.Size = UDim2.new(0, 70, 0, 14)
     lockLbl.BackgroundTransparency = 1
     lockLbl.Text = "LOCK"
-    lockLbl.TextColor3 = Color3.fromRGB(160, 160, 170)
-    lockLbl.TextSize = 11
+    lockLbl.TextColor3 = Color3.fromRGB(140, 140, 150)
+    lockLbl.TextSize = 10
     lockLbl.Font = Enum.Font.GothamBold
     lockLbl.Parent = lockBtn
 
-    -- Botão esquerda
-    local leftBtn = Instance.new("TextButton")
-    leftBtn.Name = "LeftBtn"
-    leftBtn.AnchorPoint = Vector2.new(0.5, 0.5)
-    leftBtn.Position = UDim2.new(0.15, 0, 0.4, 0)
-    leftBtn.Size = UDim2.new(0, 42, 0, 42)
-    leftBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    leftBtn.BackgroundTransparency = 0.4
-    leftBtn.BorderSizePixel = 0
-    leftBtn.Text = "◀"
-    leftBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
-    leftBtn.TextScaled = true
-    leftBtn.Font = Enum.Font.GothamBold
-    leftBtn.AutoButtonColor = false
-    leftBtn.Visible = false
-    leftBtn.Parent = btnContainer
-    Instance.new("UICorner", leftBtn).CornerRadius = UDim.new(0.3, 0)
+    -- ═══ DRAG LOGIC ═══
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    local totalDist = 0
 
-    -- Botão direita
-    local rightBtn = Instance.new("TextButton")
-    rightBtn.Name = "RightBtn"
-    rightBtn.AnchorPoint = Vector2.new(0.5, 0.5)
-    rightBtn.Position = UDim2.new(0.85, 0, 0.4, 0)
-    rightBtn.Size = UDim2.new(0, 42, 0, 42)
-    rightBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    rightBtn.BackgroundTransparency = 0.4
-    rightBtn.BorderSizePixel = 0
-    rightBtn.Text = "▶"
-    rightBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
-    rightBtn.TextScaled = true
-    rightBtn.Font = Enum.Font.GothamBold
-    rightBtn.AutoButtonColor = false
-    rightBtn.Visible = false
-    rightBtn.Parent = btnContainer
-    Instance.new("UICorner", rightBtn).CornerRadius = UDim.new(0.3, 0)
+    -- Usamos InputBegan/Changed/Ended no próprio frame
+    lockBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = btnFrame.Position
+            totalDist = 0
+            State.ButtonDragging = false
+        end
+    end)
 
-    -- ═══ PAINEL DE INFO DO ALVO ═══
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.Touch
+            and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+        local delta = input.Position - dragStart
+        totalDist = math.max(totalDist, delta.Magnitude)
+
+        if totalDist > CONFIG.DragThreshold then
+            State.ButtonDragging = true
+            btnFrame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + (input.Position.X - dragStart.X),
+                startPos.Y.Scale,
+                startPos.Y.Offset + (input.Position.Y - dragStart.Y)
+            )
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if dragging then
+                dragging = false
+                if State.ButtonDragging then
+                    State.SavedButtonPos = btnFrame.Position
+                end
+                -- Delay pra não triggar click junto
+                task.delay(0.05, function()
+                    State.ButtonDragging = false
+                end)
+            end
+        end
+    end)
+
+    -- ═══ SWITCH BUTTONS ═══
+    local switchCont = Instance.new("Frame")
+    switchCont.Name = "Switch"
+    switchCont.AnchorPoint = Vector2.new(0.5, 0)
+    switchCont.Position = UDim2.new(0.5, 0, 1, 22)
+    switchCont.Size = UDim2.new(0, 120, 0, 36)
+    switchCont.BackgroundTransparency = 1
+    switchCont.Visible = false
+    switchCont.Parent = btnFrame
+
+    local function MakeSwitchBtn(name, text, posX)
+        local btn = Instance.new("TextButton")
+        btn.Name = name
+        btn.Size = UDim2.new(0, 48, 0, 36)
+        btn.Position = UDim2.new(posX, 0, 0, 0)
+        btn.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+        btn.BackgroundTransparency = 0.3
+        btn.BorderSizePixel = 0
+        btn.Text = text
+        btn.TextColor3 = Color3.fromRGB(180, 180, 190)
+        btn.TextSize = 16
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        btn.Parent = switchCont
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+        return btn
+    end
+
+    local leftBtn = MakeSwitchBtn("Left", "◀", 0)
+    local rightBtn = MakeSwitchBtn("Right", "▶", UDim.new(1, -48))
+    rightBtn.Position = UDim2.new(1, -48, 0, 0)
+
+    -- ═══ TARGET INFO ═══
     local infoPanel = Instance.new("Frame")
     infoPanel.Name = "TargetInfo"
     infoPanel.AnchorPoint = Vector2.new(0.5, 0)
-    infoPanel.Position = UDim2.new(0.5, 0, 0, 70)
-    infoPanel.Size = UDim2.new(0, 220, 0, 48)
-    infoPanel.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-    infoPanel.BackgroundTransparency = 0.35
+    infoPanel.Position = CONFIG.TargetInfoOffset or UDim2.new(0.5, 0, 0, 55)
+    infoPanel.Size = UDim2.new(0, 240, 0, 52)
+    infoPanel.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
+    infoPanel.BackgroundTransparency = 0.3
     infoPanel.BorderSizePixel = 0
     infoPanel.Visible = false
     infoPanel.Parent = screen
-    Instance.new("UICorner", infoPanel).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", infoPanel).CornerRadius = UDim.new(0, 10)
 
-    local infoStroke = Instance.new("UIStroke")
-    infoStroke.Color = Color3.fromRGB(255, 50, 50)
-    infoStroke.Thickness = 1
-    infoStroke.Transparency = 0.5
-    infoStroke.Parent = infoPanel
+    local infoBorder = Instance.new("UIStroke")
+    infoBorder.Color = Color3.fromRGB(255, 40, 40)
+    infoBorder.Thickness = 1.5
+    infoBorder.Transparency = 0.4
+    infoBorder.Parent = infoPanel
+
+    local miniIcon = Instance.new("TextLabel")
+    miniIcon.Size = UDim2.new(0, 18, 0, 18)
+    miniIcon.Position = UDim2.new(0, 8, 0, 5)
+    miniIcon.BackgroundTransparency = 1
+    miniIcon.Text = "◉"
+    miniIcon.TextColor3 = Color3.fromRGB(255, 60, 60)
+    miniIcon.TextSize = 14
+    miniIcon.Font = Enum.Font.GothamBold
+    miniIcon.Parent = infoPanel
+
+    -- LOS indicator dot (verde=visível, amarelo=parede)
+    local losDot = Instance.new("Frame")
+    losDot.Name = "LOSDot"
+    losDot.Size = UDim2.new(0, 6, 0, 6)
+    losDot.Position = UDim2.new(0, 10, 0, 23)
+    losDot.BackgroundColor3 = Color3.fromRGB(40, 220, 80)
+    losDot.BorderSizePixel = 0
+    losDot.Parent = infoPanel
+    Instance.new("UICorner", losDot).CornerRadius = UDim.new(1, 0)
 
     local nameLbl = Instance.new("TextLabel")
     nameLbl.Name = "Name"
-    nameLbl.Size = UDim2.new(1, -16, 0, 20)
-    nameLbl.Position = UDim2.new(0, 8, 0, 3)
+    nameLbl.Size = UDim2.new(1, -80, 0, 20)
+    nameLbl.Position = UDim2.new(0, 28, 0, 4)
     nameLbl.BackgroundTransparency = 1
     nameLbl.Text = ""
-    nameLbl.TextColor3 = Color3.fromRGB(255, 80, 80)
+    nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
     nameLbl.TextSize = 13
     nameLbl.Font = Enum.Font.GothamBold
     nameLbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -416,333 +889,638 @@ local function BuildUI()
     nameLbl.Parent = infoPanel
 
     local distLbl = Instance.new("TextLabel")
-    distLbl.Name = "Distance"
-    distLbl.Size = UDim2.new(0, 50, 0, 20)
-    distLbl.Position = UDim2.new(1, -58, 0, 3)
+    distLbl.Name = "Dist"
+    distLbl.Size = UDim2.new(0, 55, 0, 20)
+    distLbl.Position = UDim2.new(1, -60, 0, 4)
     distLbl.BackgroundTransparency = 1
     distLbl.Text = ""
-    distLbl.TextColor3 = Color3.fromRGB(180, 180, 190)
+    distLbl.TextColor3 = Color3.fromRGB(170, 170, 180)
     distLbl.TextSize = 11
     distLbl.Font = Enum.Font.Gotham
     distLbl.TextXAlignment = Enum.TextXAlignment.Right
     distLbl.Parent = infoPanel
 
     local hpBg = Instance.new("Frame")
-    hpBg.Name = "HPBg"
-    hpBg.Size = UDim2.new(1, -16, 0, 8)
-    hpBg.Position = UDim2.new(0, 8, 0, 28)
-    hpBg.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+    hpBg.Size = UDim2.new(1, -20, 0, 8)
+    hpBg.Position = UDim2.new(0, 10, 1, -16)
+    hpBg.BackgroundColor3 = Color3.fromRGB(45, 45, 50)
     hpBg.BorderSizePixel = 0
     hpBg.Parent = infoPanel
     Instance.new("UICorner", hpBg).CornerRadius = UDim.new(0, 4)
 
+    local hpGhost = Instance.new("Frame")
+    hpGhost.Name = "Ghost"
+    hpGhost.Size = UDim2.new(1, 0, 1, 0)
+    hpGhost.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    hpGhost.BackgroundTransparency = 0.5
+    hpGhost.BorderSizePixel = 0
+    hpGhost.ZIndex = 1
+    hpGhost.Parent = hpBg
+    Instance.new("UICorner", hpGhost).CornerRadius = UDim.new(0, 4)
+
     local hpFill = Instance.new("Frame")
-    hpFill.Name = "HPFill"
+    hpFill.Name = "Fill"
     hpFill.Size = UDim2.new(1, 0, 1, 0)
-    hpFill.BackgroundColor3 = Color3.fromRGB(50, 220, 80)
+    hpFill.BackgroundColor3 = Color3.fromRGB(40, 220, 80)
     hpFill.BorderSizePixel = 0
+    hpFill.ZIndex = 2
     hpFill.Parent = hpBg
     Instance.new("UICorner", hpFill).CornerRadius = UDim.new(0, 4)
 
-    -- Refs
+    -- Save refs
     UI.Screen     = screen
+    UI.BtnFrame   = btnFrame
     UI.LockBtn    = lockBtn
-    UI.LockStroke = lockStroke
+    UI.BtnStroke  = btnStroke
+    UI.BtnGlow    = btnGlow
     UI.LockLabel  = lockLbl
+    UI.SwitchCont = switchCont
     UI.LeftBtn    = leftBtn
     UI.RightBtn   = rightBtn
     UI.InfoPanel  = infoPanel
     UI.NameLabel  = nameLbl
     UI.DistLabel  = distLbl
     UI.HPFill     = hpFill
-
-    return screen
+    UI.HPGhost    = hpGhost
+    UI.LOSDot     = losDot
 end
 
 -- ══════════════════════════════════════════════════════
--- UPDATE VISUAL DA UI
+-- UI UPDATES
 -- ══════════════════════════════════════════════════════
-local function UpdateUI()
+local function UpdateButtonVisual()
     if not UI.LockBtn then return end
 
     if State.IsLocked then
-        UI.LockStroke.Color = Color3.fromRGB(255, 55, 55)
-        UI.LockStroke.Thickness = 3
-        UI.LockBtn.BackgroundColor3 = Color3.fromRGB(70, 12, 12)
-        UI.LockBtn.BackgroundTransparency = 0.1
+        pcall(function()
+            TweenService:Create(UI.BtnStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(255, 45, 45), Thickness = 3}):Play()
+            TweenService:Create(UI.BtnGlow, TweenInfo.new(0.2), {Thickness = 4, Transparency = 0.5}):Play()
+            TweenService:Create(UI.LockBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(65, 10, 10), BackgroundTransparency = 0.05}):Play()
+        end)
         UI.LockBtn.Text = "◉"
-        UI.LockBtn.TextColor3 = Color3.fromRGB(255, 90, 90)
+        UI.LockBtn.TextColor3 = Color3.fromRGB(255, 85, 85)
         UI.LockLabel.Text = "LOCKED"
-        UI.LockLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
-        UI.LeftBtn.Visible = true
-        UI.RightBtn.Visible = true
+        UI.LockLabel.TextColor3 = Color3.fromRGB(255, 70, 70)
+        UI.SwitchCont.Visible = true
         UI.InfoPanel.Visible = CONFIG.ShowTargetInfo
     else
-        UI.LockStroke.Color = Color3.fromRGB(150, 150, 160)
-        UI.LockStroke.Thickness = 2.5
-        UI.LockBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-        UI.LockBtn.BackgroundTransparency = 0.2
+        pcall(function()
+            TweenService:Create(UI.BtnStroke, TweenInfo.new(0.2), {Color = Color3.fromRGB(130, 130, 145), Thickness = 2}):Play()
+            TweenService:Create(UI.BtnGlow, TweenInfo.new(0.2), {Thickness = 0, Transparency = 1}):Play()
+            TweenService:Create(UI.LockBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(30, 30, 35), BackgroundTransparency = 0.15}):Play()
+        end)
         UI.LockBtn.Text = "⊕"
-        UI.LockBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+        UI.LockBtn.TextColor3 = Color3.fromRGB(190, 190, 200)
         UI.LockLabel.Text = "LOCK"
-        UI.LockLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
-        UI.LeftBtn.Visible = false
-        UI.RightBtn.Visible = false
+        UI.LockLabel.TextColor3 = Color3.fromRGB(140, 140, 150)
+        UI.SwitchCont.Visible = false
         UI.InfoPanel.Visible = false
     end
 end
 
+local lastHP = 1
 local function UpdateTargetInfo()
-    if not State.IsLocked or not State.LockedTarget then return end
+    if not State.IsLocked or not State.CachedTargetHum then return end
     if not UI.NameLabel then return end
 
-    local _, _, hum = GetCharacterParts(State.LockedTarget)
-    if not hum then return end
-
     -- Nome
-    UI.NameLabel.Text = State.LockedTarget.DisplayName or State.LockedTarget.Name
+    local displayName = State.Target.DisplayName or State.Target.Name
+    UI.NameLabel.Text = displayName
 
     -- Distância
-    local dist = math.floor(DistanceTo(State.LockedTarget))
-    UI.DistLabel.Text = dist .. "m"
+    local d = math.floor(Dist(State.Target))
+    UI.DistLabel.Text = d .. "m"
+
+    -- LOS dot
+    local losColor = State.HasLineOfSight
+        and Color3.fromRGB(40, 220, 80)
+        or Color3.fromRGB(255, 180, 30)
+    pcall(function()
+        TweenService:Create(UI.LOSDot, TweenInfo.new(0.2), {BackgroundColor3 = losColor}):Play()
+    end)
 
     -- HP
-    local pct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+    local pct = math.clamp(State.CachedTargetHum.Health / State.CachedTargetHum.MaxHealth, 0, 1)
 
-    TweenService:Create(UI.HPFill, TweenInfo.new(0.2), {
-        Size = UDim2.new(pct, 0, 1, 0)
-    }):Play()
+    pcall(function()
+        TweenService:Create(UI.HPFill, TweenInfo.new(0.15), {Size = UDim2.new(pct, 0, 1, 0)}):Play()
+    end)
 
-    -- Cor: verde → amarelo → vermelho
-    local color
-    if pct > 0.6 then
-        color = Color3.fromRGB(50, 220, 80)
-    elseif pct > 0.3 then
-        color = Color3.fromRGB(240, 200, 40)
-    else
-        color = Color3.fromRGB(255, 55, 55)
-    end
-
-    TweenService:Create(UI.HPFill, TweenInfo.new(0.3), {
-        BackgroundColor3 = color
-    }):Play()
-end
-
--- ══════════════════════════════════════════════════════
--- LOCK / UNLOCK CORE
--- ══════════════════════════════════════════════════════
-local function Unlock()
-    State.LockedTarget = nil
-    State.IsLocked = false
-    DestroyIndicator()
-    UpdateUI()
-
-    -- Restaura câmera suavemente
-    Camera.CameraType = Enum.CameraType.Custom
-    TweenService:Create(Camera, TweenInfo.new(0.3), {
-        FieldOfView = State.DefaultFOV
-    }):Play()
-end
-
-local function LockOn(target)
-    if not target or not IsAlive(target) then return end
-    if target == State.LockedTarget then return end -- já travado nesse
-
-    local _, root = GetCharacterParts(target)
-    if not root then return end
-
-    State.LockedTarget = target
-    State.IsLocked = true
-
-    -- Câmera scriptada
-    Camera.CameraType = Enum.CameraType.Scriptable
-
-    TweenService:Create(Camera, TweenInfo.new(0.25), {
-        FieldOfView = CONFIG.FOVLocked
-    }):Play()
-
-    CreateIndicator(root)
-    UpdateUI()
-
-    -- Monitora morte do alvo
-    SafeDisconnect("TargetDied")
-    local _, _, hum = GetCharacterParts(target)
-    if hum then
-        State.Connections["TargetDied"] = hum.Died:Connect(function()
-            if State.LockedTarget == target then
-                Unlock()
-            end
+    -- Ghost (damage flash com delay)
+    if pct < lastHP - 0.01 then
+        task.delay(0.4, function()
+            pcall(function()
+                TweenService:Create(UI.HPGhost, TweenInfo.new(0.5), {Size = UDim2.new(pct, 0, 1, 0)}):Play()
+            end)
+        end)
+    elseif pct > lastHP then
+        -- Heal: ghost acompanha
+        pcall(function()
+            TweenService:Create(UI.HPGhost, TweenInfo.new(0.2), {Size = UDim2.new(pct, 0, 1, 0)}):Play()
         end)
     end
+    lastHP = pct
 
-    -- Monitora se o alvo sair do jogo
-    SafeDisconnect("TargetLeft")
-    State.Connections["TargetLeft"] = Players.PlayerRemoving:Connect(function(p)
-        if p == State.LockedTarget then
-            Unlock()
-        end
+    -- Cor HP
+    local color
+    if pct > 0.6 then     color = Color3.fromRGB(40, 220, 80)
+    elseif pct > 0.3 then color = Color3.fromRGB(245, 200, 30)
+    elseif pct > 0.1 then color = Color3.fromRGB(255, 80, 30)
+    else                   color = Color3.fromRGB(255, 40, 40)
+    end
+
+    pcall(function()
+        TweenService:Create(UI.HPFill, TweenInfo.new(0.25), {BackgroundColor3 = color}):Play()
     end)
 end
 
--- Forward reference pra CycleTarget poder chamar LockOn
-_G._LockOnFn = LockOn
-
 -- ══════════════════════════════════════════════════════
--- AUTO-LOCK AO BATER
+-- LOCK / UNLOCK / CYCLE
 -- ══════════════════════════════════════════════════════
-local function ConnectToolHit(tool)
-    if not tool:IsA("Tool") then return end
 
-    local function TryConnect(handle)
-        if not handle then return end
-        handle.Touched:Connect(function(hit)
-            if State.IsLocked then return end
-            if not CONFIG.AutoLockOnHit then return end
+-- Forward declarations
+local LockOn, Unlock, CycleTarget
 
-            local hitModel = hit:FindFirstAncestorOfClass("Model")
-            if not hitModel then return end
+Unlock = function()
+    local hadTarget = State.Target ~= nil
 
-            local hitPlayer = Players:GetPlayerFromCharacter(hitModel)
-            if hitPlayer and hitPlayer ~= LocalPlayer and IsAlive(hitPlayer) then
-                LockOn(hitPlayer)
-            end
+    State.Target = nil
+    State.IsLocked = false
+    State.TargetVelocity = Vector3.zero
+    State.SmoothedPrediction = Vector3.zero
+    State.LastTargetPos = nil
+    State.WallLossTimer = 0
+    State.HasLineOfSight = true
+    State.OrbitalOffset = 0
+    State.CachedTargetRoot = nil
+    State.CachedTargetHum = nil
+    State.CachedTargetChar = nil
+    lastHP = 1
+
+    DestroyIndicator()
+    Disconn("TargetDied")
+    Disconn("TargetLeft")
+    Disconn("TargetCharRemoved")  -- FIX: agora desconecta corretamente
+
+    Camera.CameraType = Enum.CameraType.Custom
+
+    if hadTarget then
+        pcall(function()
+            TweenService:Create(Camera, TweenInfo.new(CONFIG.FOVTransitionTime or 0.35, Enum.EasingStyle.Quad), {
+                FieldOfView = State.DefaultFOV
+            }):Play()
         end)
     end
 
-    -- Handle pode já existir ou aparecer depois
-    local handle = tool:FindFirstChild("Handle")
-    if handle then
-        TryConnect(handle)
+    UpdateButtonVisual()
+end
+
+LockOn = function(target)
+    if not target or not Alive(target) then return end
+
+    local _, root, hum = GetParts(target)
+    if not root or not hum then return end
+
+    local isSwitching = State.IsLocked and State.Target ~= nil and State.Target ~= target
+
+    -- Limpa anterior
+    DestroyIndicator()
+    Disconn("TargetDied")
+    Disconn("TargetLeft")
+    Disconn("TargetCharRemoved")
+
+    -- Seta novo alvo
+    State.Target = target
+    State.IsLocked = true
+    State.LastTargetPos = root.Position
+    State.SmoothedPrediction = root.Position
+    State.TargetVelocity = Vector3.zero
+    State.WallLossTimer = 0
+    State.HasLineOfSight = true
+    State.OrbitalOffset = 0
+
+    -- Refresh cache
+    RefreshTargetCache()
+
+    lastHP = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+    if UI.HPGhost then
+        UI.HPGhost.Size = UDim2.new(lastHP, 0, 1, 0)
+    end
+
+    Camera.CameraType = Enum.CameraType.Scriptable
+
+    -- FOV dinâmico inicial
+    local dist = (State.Root.Position - root.Position).Magnitude
+    local fovT = math.clamp((dist - CONFIG.FOVCloseDistance) / (CONFIG.FOVFarDistance - CONFIG.FOVCloseDistance), 0, 1)
+    local targetFOV = CONFIG.FOVClose + (CONFIG.FOVFar - CONFIG.FOVClose) * fovT
+
+    pcall(function()
+        TweenService:Create(Camera, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {FieldOfView = targetFOV}):Play()
+    end)
+
+    State.CurrentFOV = targetFOV
+
+    -- Indicator com fade se trocando
+    CreateIndicator(root, isSwitching)
+    if isSwitching then
+        FlashSwitchFeedback()
+    end
+
+    UpdateButtonVisual()
+
+    -- Monitor morte
+    Conn("TargetDied", hum.Died:Connect(function()
+        if State.Target ~= target then return end
+        if CONFIG.AutoSwitchOnKill then
+            task.defer(function()
+                local next = FindBestTarget()
+                if next then LockOn(next) else Unlock() end
+            end)
+        else
+            Unlock()
+        end
+    end))
+
+    -- Monitor saída
+    Conn("TargetLeft", Players.PlayerRemoving:Connect(function(p)
+        if p == target then
+            task.defer(function()
+                if CONFIG.AutoSwitchOnKill then
+                    local next = FindBestTarget()
+                    if next then LockOn(next) else Unlock() end
+                else
+                    Unlock()
+                end
+            end)
+        end
+    end))
+
+    -- Monitor respawn do alvo
+    Conn("TargetCharRemoved", target.CharacterRemoving:Connect(function()
+        if State.Target ~= target then return end
+        task.delay(0.3, function()
+            if State.Target == target and not Alive(target) then
+                if CONFIG.AutoSwitchOnKill then
+                    local next = FindBestTarget()
+                    if next then LockOn(next) else Unlock() end
+                else
+                    Unlock()
+                end
+            end
+        end)
+    end))
+end
+
+CycleTarget = function(direction)
+    if not State.IsLocked then return end
+    local targets = GetScoredTargets()
+    if #targets <= 1 then return end
+
+    local idx = 0
+    for i, t in ipairs(targets) do
+        if t.Target == State.Target then idx = i; break end
+    end
+
+    idx = idx + direction
+    if idx < 1 then idx = #targets end
+    if idx > #targets then idx = 1 end
+
+    LockOn(targets[idx].Target)
+end
+
+-- ══════════════════════════════════════════════════════
+-- AIM FRICTION (sem lock) — sticky aim estilo console
+-- ══════════════════════════════════════════════════════
+local function ApplyAimFriction(dt)
+    if not CONFIG.AimFrictionEnabled then return end
+    if State.IsLocked then return end  -- friction só sem lock
+    if not State.Root then return end
+
+    local vpSize = Camera.ViewportSize
+    local screenCenter = Vector2.new(vpSize.X / 2, vpSize.Y / 2)
+
+    local closestScreenDist = math.huge
+    local frictionActive = false
+
+    -- Checa se algum inimigo tá perto do centro da tela
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and Alive(player) then
+            local _, root = GetParts(player)
+            if root then
+                local worldDist = (State.Root.Position - root.Position).Magnitude
+                if worldDist <= CONFIG.AimFrictionRange then
+                    local screenPos, onScreen = Camera:WorldToScreenPoint(root.Position + Vector3.new(0, 1.5, 0))
+                    if onScreen then
+                        local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                        if screenDist < CONFIG.AimFrictionRadius then
+                            closestScreenDist = math.min(closestScreenDist, screenDist)
+                            frictionActive = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- O friction é aplicado pelo InputChanged hook abaixo
+    State._aimFrictionMultiplier = 1
+    if frictionActive then
+        local proximity = 1 - (closestScreenDist / CONFIG.AimFrictionRadius)
+        State._aimFrictionMultiplier = 1 - (proximity * CONFIG.AimFrictionStrength)
+    end
+end
+
+-- Hook no input da câmera pra aplicar friction
+Conn("AimFriction", UserInputService.InputChanged:Connect(function(input)
+    if State.IsLocked then return end
+    if not CONFIG.AimFrictionEnabled then return end
+
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        -- Não podemos modificar o input diretamente, mas podemos
+        -- compensar via CameraOffset ou UserInputService.MouseDeltaSensitivity
+        -- Approach: ajustar MouseDeltaSensitivity
+        local mult = State._aimFrictionMultiplier or 1
+        pcall(function()
+            UserInputService.MouseDeltaSensitivity = mult
+        end)
+    end
+end))
+
+-- Restaura sensibilidade quando não tem friction
+local function ResetAimFriction()
+    pcall(function()
+        UserInputService.MouseDeltaSensitivity = 1
+    end)
+end
+
+-- ══════════════════════════════════════════════════════
+-- AUTO-LOCK HIT DETECTION
+-- ══════════════════════════════════════════════════════
+local function TryAutoLock(hitPart)
+    if State.IsLocked then return end
+    if not CONFIG.AutoLockOnHit then return end
+
+    local model = hitPart:FindFirstAncestorOfClass("Model")
+    if not model then return end
+
+    local player = Players:GetPlayerFromCharacter(model)
+    if player and player ~= LocalPlayer and Alive(player) then
+        LockOn(player)
+    end
+end
+
+-- Detecta dano recebido (pra threat scoring)
+local function SetupDamageDetection()
+    if not State.Hum then return end
+
+    local lastHealth = State.Hum.Health
+    Conn("DamageTaken", State.Hum.HealthChanged:Connect(function(newHealth)
+        if newHealth < lastHealth then
+            -- Alguém nos atacou, tenta descobrir quem
+            -- Heurística: o player mais perto provavelmente atacou
+            local nearest = nil
+            local nearestDist = 25 -- range máximo de ataque
+
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and Alive(player) then
+                    local d = Dist(player)
+                    if d < nearestDist then
+                        nearestDist = d
+                        nearest = player
+                    end
+                end
+            end
+
+            if nearest then
+                RegisterAttacker(nearest)
+            end
+        end
+        lastHealth = newHealth
+    end))
+end
+
+local function ConnectToolHit(tool)
+    if not tool:IsA("Tool") then return end
+
+    local function HookPart(part)
+        if not part or not part:IsA("BasePart") then return end
+        local key = "tool_" .. tool.Name .. "_" .. part.Name .. "_" .. math.random(1000, 9999)
+        Conn(key, part.Touched:Connect(function(hit)
+            TryAutoLock(hit)
+        end))
+    end
+
+    for _, child in ipairs(tool:GetChildren()) do
+        if child:IsA("BasePart") then HookPart(child) end
     end
     tool.ChildAdded:Connect(function(child)
-        if child.Name == "Handle" then
-            TryConnect(child)
-        end
+        if child:IsA("BasePart") then HookPart(child) end
     end)
 end
 
 local function SetupHitDetection(char)
     if not char then return end
+    DisconnGroup("tool_")
+
     for _, child in ipairs(char:GetChildren()) do
         ConnectToolHit(child)
     end
-    SafeDisconnect("ToolAdded")
-    State.Connections["ToolAdded"] = char.ChildAdded:Connect(ConnectToolHit)
+    Conn("CharToolAdded", char.ChildAdded:Connect(ConnectToolHit))
 end
 
 -- ══════════════════════════════════════════════════════
--- CÂMERA LOOP
+-- ORBITAL CAMERA — mouse/stick ajusta ângulo lateral
 -- ══════════════════════════════════════════════════════
-local function UpdateCamera()
-    if not State.IsLocked or not State.LockedTarget then return end
-    if not State.RootPart then return end
+local function UpdateOrbital(dt)
+    if not CONFIG.OrbitalEnabled then return end
+    if not State.IsLocked then
+        State.OrbitalOffset = 0
+        return
+    end
 
-    local _, targetRoot = GetCharacterParts(State.LockedTarget)
-    if not targetRoot then
+    -- Gamepad right stick
+    local gamepadInput = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)
+    if gamepadInput then
+        for _, obj in ipairs(gamepadInput) do
+            if obj.KeyCode == Enum.KeyCode.Thumbstick2 then
+                local x = obj.Position.X
+                if math.abs(x) > 0.15 then -- deadzone
+                    State.OrbitalOffset = State.OrbitalOffset + x * CONFIG.OrbitalSpeed * 60 * dt
+                end
+            end
+        end
+    end
+
+    -- Clamp
+    State.OrbitalOffset = math.clamp(State.OrbitalOffset, -CONFIG.OrbitalMaxAngle, CONFIG.OrbitalMaxAngle)
+
+    -- Decay pro centro (quando não tá movendo)
+    local decayAlpha = ExpDecay(CONFIG.OrbitalDecayRate, dt)
+    State.OrbitalOffset = SafeLerp(State.OrbitalOffset, 0, decayAlpha * 0.3)
+end
+
+-- Mouse orbital: shift + mouse move
+Conn("MouseOrbital", UserInputService.InputChanged:Connect(function(input)
+    if not State.IsLocked or not CONFIG.OrbitalEnabled then return end
+
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+            local delta = input.Delta.X
+            State.OrbitalOffset = State.OrbitalOffset + delta * CONFIG.OrbitalSpeed
+            State.OrbitalOffset = math.clamp(State.OrbitalOffset, -CONFIG.OrbitalMaxAngle, CONFIG.OrbitalMaxAngle)
+        end
+    end
+end))
+
+-- ══════════════════════════════════════════════════════
+-- MAIN CAMERA LOOP — framerate independent
+-- ══════════════════════════════════════════════════════
+local function UpdateCamera(dt)
+    -- Aim friction (roda sempre, mesmo sem lock)
+    ApplyAimFriction(dt)
+
+    if not State.IsLocked or not State.Target then
+        ResetAimFriction()
+        return
+    end
+    if not State.Root then return end
+
+    -- Refresh cache
+    RefreshTargetCache()
+
+    if not State.CachedTargetRoot then
         Unlock()
         return
     end
 
-    -- Checa distância
-    local dist = (State.RootPart.Position - targetRoot.Position).Magnitude
-    if dist > CONFIG.MaxLockDistance * 1.5 then
+    -- Wall validation
+    UpdateWallValidation(dt)
+
+    -- Distance check
+    local dist = (State.Root.Position - State.CachedTargetRoot.Position).Magnitude
+    if dist > CONFIG.MaxLockDistance * 1.6 then
         Unlock()
         return
     end
 
-    -- Calcula posição da câmera
-    local playerPos = State.RootPart.Position
-    local targetPos = targetRoot.Position + CONFIG.HeightOffset
+    -- Update prediction
+    UpdatePrediction(dt)
 
-    local lookDir = (targetPos - playerPos)
-    if lookDir.Magnitude < 0.1 then return end
-    lookDir = lookDir.Unit
+    -- Update orbital
+    UpdateOrbital(dt)
 
-    local camPos = playerPos
-        - lookDir * CONFIG.CameraOffset.Z
-        + Vector3.new(0, CONFIG.CameraOffset.Y, 0)
+    -- Posições
+    local playerPos = State.Root.Position
+    local predictedTarget = GetPredictedTargetPos()
+    local actualTarget = State.CachedTargetRoot.Position + Vector3.new(0, 2, 0)
 
-    -- Impede câmera de ir pra dentro de paredes
-    local camParams = RaycastParams.new()
-    camParams.FilterType = Enum.RaycastFilterType.Exclude
-    camParams.FilterDescendantsInstances = {State.Character}
+    -- Direção base pro alvo (no plano XZ)
+    local toTarget = actualTarget - playerPos
+    local flatDir = Vector3.new(toTarget.X, 0, toTarget.Z)
+    if flatDir.Magnitude < 0.5 then return end
+    flatDir = flatDir.Unit
 
-    local camRay = workspace:Raycast(playerPos + Vector3.new(0, 2, 0), camPos - (playerPos + Vector3.new(0, 2, 0)), camParams)
-    if camRay then
-        camPos = camRay.Position + camRay.Normal * 0.5
+    -- Aplica orbital offset (rotação lateral)
+    local orbitalCF = CFrame.Angles(0, State.OrbitalOffset, 0)
+    local adjustedDir = (orbitalCF * CFrame.new(Vector3.zero, flatDir)).LookVector
+
+    -- Posição da câmera
+    local camGoal = playerPos
+        - adjustedDir * CONFIG.CameraDistance
+        + Vector3.new(0, CONFIG.CameraHeight, 0)
+
+    -- SPHERE CAST anti-wall (4 raycasts)
+    local wallCheckOrigin = playerPos + Vector3.new(0, 2, 0)
+    local ignoreChars = GetAllCharacters()
+
+    local wallHit = SphereCast(wallCheckOrigin, camGoal, 0.5, ignoreChars)
+    if wallHit then
+        camGoal = wallHit.Position + wallHit.Normal * 0.9
+        if camGoal.Y < playerPos.Y + 1.5 then
+            camGoal = Vector3.new(camGoal.X, playerPos.Y + 1.5, camGoal.Z)
+        end
     end
 
-    -- Ponto de foco: entre player e alvo
-    local lookAt = playerPos:Lerp(targetPos, 0.55)
+    -- Ponto de foco com predição
+    local focusPoint = playerPos:Lerp(predictedTarget, CONFIG.LookAtBias)
 
-    local goalCF = CFrame.lookAt(camPos, lookAt)
-    Camera.CFrame = Camera.CFrame:Lerp(goalCF, CONFIG.LockSmoothness)
+    -- Goal CFrame
+    local goalCF = CFrame.lookAt(camGoal, focusPoint)
 
-    -- Atualiza info do alvo
+    -- FRAMERATE INDEPENDENT lerp
+    local camAlpha = ExpDecay(CONFIG.CamSmoothRate, dt)
+    Camera.CFrame = SafeLerp(Camera.CFrame, goalCF, camAlpha)
+
+    -- FOV DINÂMICO por distância
+    local fovT = math.clamp(
+        (dist - CONFIG.FOVCloseDistance) / (CONFIG.FOVFarDistance - CONFIG.FOVCloseDistance),
+        0, 1
+    )
+    local targetFOV = CONFIG.FOVClose + (CONFIG.FOVFar - CONFIG.FOVClose) * fovT
+    local fovAlpha = ExpDecay(CONFIG.FOVSmoothRate, dt)
+    State.CurrentFOV = SafeLerp(State.CurrentFOV, targetFOV, fovAlpha)
+    Camera.FieldOfView = State.CurrentFOV
+
+    -- Update UI info
     UpdateTargetInfo()
 end
 
 -- ══════════════════════════════════════════════════════
--- SETUP DO PERSONAGEM
+-- CHARACTER SETUP
 -- ══════════════════════════════════════════════════════
-local function OnCharacterAdded(char)
-    State.Character = char
-    State.Humanoid = char:WaitForChild("Humanoid", 10)
-    State.RootPart = char:WaitForChild("HumanoidRootPart", 10)
+local function OnCharacter(char)
+    State.Char = char
+    State.Hum = char:WaitForChild("Humanoid", 10)
+    State.Root = char:WaitForChild("HumanoidRootPart", 10)
 
-    if not State.Humanoid or not State.RootPart then
-        warn("[LockOn] Falha ao encontrar Humanoid/RootPart")
+    if not State.Hum or not State.Root then
+        warn("[LockOn v4] Humanoid/RootPart não encontrado")
         return
     end
 
-    -- Destrava se tava travado
-    if State.IsLocked then
-        Unlock()
-    end
+    if State.IsLocked then Unlock() end
 
-    -- Morte do próprio player
-    SafeDisconnect("SelfDied")
-    State.Connections["SelfDied"] = State.Humanoid.Died:Connect(function()
+    Conn("SelfDied", State.Hum.Died:Connect(function()
         Unlock()
-    end)
+    end))
 
-    -- Hit detection
     task.delay(0.5, function()
-        SetupHitDetection(char)
+        if State.Char == char then
+            SetupHitDetection(char)
+            SetupDamageDetection()
+        end
     end)
 end
 
 -- ══════════════════════════════════════════════════════
--- INPUT: TECLADO
+-- INPUT
 -- ══════════════════════════════════════════════════════
+
+-- Teclado + Gamepad
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
+    local key = input.KeyCode
 
-    if input.KeyCode == CONFIG.LockKey then
-        if State.IsLocked then
-            Unlock()
+    if key == CONFIG.LockKey or key == CONFIG.GamepadLock then
+        if State.IsLocked then Unlock()
         else
-            local target = FindNearest()
-            if target then LockOn(target) end
+            local t = FindBestTarget()
+            if t then LockOn(t) end
         end
-
-    elseif input.KeyCode == CONFIG.NextTargetKey then
+    elseif key == CONFIG.NextTargetKey or key == CONFIG.GamepadNext then
         CycleTarget(1)
-
-    elseif input.KeyCode == CONFIG.PrevTargetKey then
+    elseif key == CONFIG.PrevTargetKey then
         CycleTarget(-1)
     end
 end)
 
--- ══════════════════════════════════════════════════════
--- INPUT: TOUCH (SWIPE)
--- ══════════════════════════════════════════════════════
+-- Touch swipe com timeout
 UserInputService.TouchStarted:Connect(function(touch, processed)
     if processed or not State.IsLocked then return end
     local vp = Camera.ViewportSize
-    -- Só swipe na metade superior
-    if touch.Position.Y < vp.Y * 0.45 then
+    if touch.Position.Y < vp.Y * 0.4 then
         State.TouchStart = touch.Position
+        State.TouchStartTime = tick()
     end
 end)
 
@@ -751,6 +1529,13 @@ UserInputService.TouchEnded:Connect(function(touch)
         State.TouchStart = nil
         return
     end
+
+    local elapsed = tick() - State.TouchStartTime
+    if elapsed > CONFIG.SwipeTimeout then
+        State.TouchStart = nil
+        return
+    end
+
     local dx = touch.Position.X - State.TouchStart.X
     if math.abs(dx) >= CONFIG.SwipeThreshold then
         CycleTarget(dx > 0 and 1 or -1)
@@ -759,45 +1544,55 @@ UserInputService.TouchEnded:Connect(function(touch)
 end)
 
 -- ══════════════════════════════════════════════════════
--- INICIALIZAÇÃO
+-- INIT
 -- ══════════════════════════════════════════════════════
 local function Init()
-    -- UI
     BuildUI()
-    UpdateUI()
+    UpdateButtonVisual()
 
-    -- Botões mobile
+    -- Botão lock
     UI.LockBtn.MouseButton1Click:Connect(function()
-        if State.IsLocked then
-            Unlock()
+        if State.ButtonDragging then return end
+        if State.IsLocked then Unlock()
         else
-            local target = FindNearest()
-            if target then LockOn(target) end
+            local t = FindBestTarget()
+            if t then LockOn(t) end
         end
     end)
 
-    UI.LeftBtn.MouseButton1Click:Connect(function()
-        CycleTarget(-1)
-    end)
+    UI.LeftBtn.MouseButton1Click:Connect(function() CycleTarget(-1) end)
+    UI.RightBtn.MouseButton1Click:Connect(function() CycleTarget(1) end)
 
-    UI.RightBtn.MouseButton1Click:Connect(function()
-        CycleTarget(1)
-    end)
-
-    -- Personagem
+    -- Character
     if LocalPlayer.Character then
-        OnCharacterAdded(LocalPlayer.Character)
+        task.spawn(function() OnCharacter(LocalPlayer.Character) end)
     end
-    LocalPlayer.CharacterAdded:Connect(OnCharacterAdded)
+    LocalPlayer.CharacterAdded:Connect(OnCharacter)
 
-    -- Render loop
+    -- Main loop
     RunService.RenderStepped:Connect(UpdateCamera)
 
-    print("══════════════════════════════════════")
-    print("  LOCK-ON SYSTEM v2.0 — ATIVO")
-    print("  PC:  Q=Lock | E=Next | R=Prev")
-    print("  Mobile: Botões na tela / Swipe")
-    print("══════════════════════════════════════")
+    -- Cleanup ao sair
+    LocalPlayer.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            ResetAimFriction()
+            Unlock()
+        end
+    end)
+
+    print("══════════════════════════════════════════════")
+    print("  LOCK-ON SYSTEM v4.0 CONSOLE GRADE — ATIVO")
+    print("  PC:     Q=Lock  E=Next  R=Prev")
+    print("          Shift+Mouse = Orbital adjust")
+    print("  Mobile: Arraste botão | ◀ ▶ | Swipe")
+    print("  Gamepad: RB=Lock  RS=Cycle  RStick=Orbital")
+    print("")
+    print("  ✦ Predição framerate-independent")
+    print("  ✦ Aim friction: " .. tostring(CONFIG.AimFrictionEnabled))
+    print("  ✦ FOV dinâmico: " .. CONFIG.FOVFar .. "-" .. CONFIG.FOVClose)
+    print("  ✦ Threat scoring: ON")
+    print("  ✦ Wall timeout: " .. CONFIG.WallLossTimeout .. "s")
+    print("══════════════════════════════════════════════")
 end
 
 Init()
