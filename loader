@@ -1,245 +1,268 @@
 --[[
-    ╔══════════════════════════════════════════════════╗
-    ║          LOCK-ON SYSTEM — LOADER v1.0            ║
-    ║          Cola este script pra carregar            ║
-    ╚══════════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════╗
+    ║          LOCK-ON SYSTEM v4.0 — LOADER                    ║
+    ║          Console Grade • Predictive • Threat AI          ║
+    ╚══════════════════════════════════════════════════════════════╝
     
     COMO USAR:
-    1. Coloque o script principal (LockOnSystem) como
-       ModuleScript dentro de ReplicatedStorage
-       com o nome "LockOnSystem"
     
-    2. Cole ESTE loader como LocalScript dentro de
-       StarterPlayerScripts
+    MÉTODO 1 (Direto — recomendado):
+      → Cole o LockOnSystem_v4 como LocalScript em
+        StarterPlayerScripts. Ignore este loader.
     
-    OU: Se não quiser usar ModuleScript, simplesmente
-        cole o script principal inteiro como LocalScript
-        em StarterPlayerScripts e ignore este loader.
+    MÉTODO 2 (Com loader):
+      → LockOnSystem_v4 como ModuleScript em ReplicatedStorage
+        com nome "LockOnSystem_v4"
+      → Este arquivo como LocalScript em StarterPlayerScripts
+      → Descomente a linha require() na seção LOAD
 --]]
 
-local Players        = game:GetService("Players")
-local TweenService   = game:GetService("TweenService")
-local LocalPlayer    = Players.LocalPlayer
-local PlayerGui      = LocalPlayer:WaitForChild("PlayerGui")
+local Players      = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer  = Players.LocalPlayer
+local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
 
--- ══════════════════════════════════════════════════════
--- SPLASH SCREEN / LOADING UI
--- ══════════════════════════════════════════════════════
-local function ShowLoader()
-    local screen = Instance.new("ScreenGui")
-    screen.Name = "LockOnLoader"
-    screen.ResetOnSpawn = false
-    screen.DisplayOrder = 999
-    screen.IgnoreGuiInset = true
-    screen.Parent = PlayerGui
+local function Splash()
+    local scr = Instance.new("ScreenGui")
+    scr.Name = "LockOnSplash"
+    scr.ResetOnSpawn = false
+    scr.DisplayOrder = 9999
+    scr.IgnoreGuiInset = true
+    scr.Parent = PlayerGui
 
-    -- Fundo escuro
     local bg = Instance.new("Frame")
     bg.Size = UDim2.new(1, 0, 1, 0)
-    bg.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
-    bg.BackgroundTransparency = 0
+    bg.BackgroundColor3 = Color3.fromRGB(5, 5, 10)
     bg.BorderSizePixel = 0
-    bg.Parent = screen
+    bg.Parent = scr
 
-    -- Container central
-    local center = Instance.new("Frame")
-    center.AnchorPoint = Vector2.new(0.5, 0.5)
-    center.Position = UDim2.new(0.5, 0, 0.45, 0)
-    center.Size = UDim2.new(0, 300, 0, 200)
-    center.BackgroundTransparency = 1
-    center.Parent = bg
+    local grad = Instance.new("UIGradient")
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(8, 3, 18)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(5, 5, 10)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 3, 3)),
+    })
+    grad.Rotation = 45
+    grad.Parent = bg
 
-    -- Ícone de mira animado
+    local c = Instance.new("Frame")
+    c.AnchorPoint = Vector2.new(0.5, 0.5)
+    c.Position = UDim2.new(0.5, 0, 0.42, 0)
+    c.Size = UDim2.new(0, 340, 0, 280)
+    c.BackgroundTransparency = 1
+    c.Parent = bg
+
+    -- Anel girante externo
+    local outer = Instance.new("TextLabel")
+    outer.AnchorPoint = Vector2.new(0.5, 0.5)
+    outer.Position = UDim2.new(0.5, 0, 0.18, 0)
+    outer.Size = UDim2.new(0, 100, 0, 100)
+    outer.BackgroundTransparency = 1
+    outer.Text = "◎"
+    outer.TextColor3 = Color3.fromRGB(255, 30, 30)
+    outer.TextScaled = true
+    outer.TextTransparency = 0.5
+    outer.Font = Enum.Font.GothamBold
+    outer.Parent = c
+
+    -- Ícone centro
     local icon = Instance.new("TextLabel")
     icon.AnchorPoint = Vector2.new(0.5, 0.5)
-    icon.Position = UDim2.new(0.5, 0, 0.25, 0)
-    icon.Size = UDim2.new(0, 80, 0, 80)
+    icon.Position = UDim2.new(0.5, 0, 0.18, 0)
+    icon.Size = UDim2.new(0, 55, 0, 55)
     icon.BackgroundTransparency = 1
     icon.Text = "⊕"
-    icon.TextColor3 = Color3.fromRGB(255, 50, 50)
+    icon.TextColor3 = Color3.fromRGB(255, 55, 55)
     icon.TextScaled = true
     icon.Font = Enum.Font.GothamBold
-    icon.Rotation = 0
-    icon.Parent = center
+    icon.Parent = c
 
-    -- Título
+    -- Textos
     local title = Instance.new("TextLabel")
     title.AnchorPoint = Vector2.new(0.5, 0)
-    title.Position = UDim2.new(0.5, 0, 0.5, 5)
-    title.Size = UDim2.new(1, 0, 0, 30)
+    title.Position = UDim2.new(0.5, 0, 0.4, 0)
+    title.Size = UDim2.new(1, 0, 0, 28)
     title.BackgroundTransparency = 1
     title.Text = "LOCK-ON SYSTEM"
     title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.TextSize = 22
+    title.TextSize = 24
     title.Font = Enum.Font.GothamBold
     title.TextTransparency = 1
-    title.Parent = center
+    title.Parent = c
 
-    -- Versão
     local ver = Instance.new("TextLabel")
     ver.AnchorPoint = Vector2.new(0.5, 0)
-    ver.Position = UDim2.new(0.5, 0, 0.5, 35)
-    ver.Size = UDim2.new(1, 0, 0, 18)
+    ver.Position = UDim2.new(0.5, 0, 0.4, 30)
+    ver.Size = UDim2.new(1, 0, 0, 16)
     ver.BackgroundTransparency = 1
-    ver.Text = "v2.0 — Mobile + PC"
-    ver.TextColor3 = Color3.fromRGB(150, 150, 160)
-    ver.TextSize = 13
+    ver.Text = "v4.0 CONSOLE GRADE"
+    ver.TextColor3 = Color3.fromRGB(255, 70, 70)
+    ver.TextSize = 12
     ver.Font = Enum.Font.Gotham
     ver.TextTransparency = 1
-    ver.Parent = center
+    ver.Parent = c
 
-    -- Barra de loading
+    -- Barra
     local barBg = Instance.new("Frame")
     barBg.AnchorPoint = Vector2.new(0.5, 0)
-    barBg.Position = UDim2.new(0.5, 0, 0.75, 0)
-    barBg.Size = UDim2.new(0.7, 0, 0, 4)
-    barBg.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    barBg.Position = UDim2.new(0.5, 0, 0.65, 0)
+    barBg.Size = UDim2.new(0.6, 0, 0, 3)
+    barBg.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
     barBg.BorderSizePixel = 0
-    barBg.Parent = center
+    barBg.Parent = c
     Instance.new("UICorner", barBg).CornerRadius = UDim.new(1, 0)
 
     local barFill = Instance.new("Frame")
     barFill.Size = UDim2.new(0, 0, 1, 0)
-    barFill.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+    barFill.BackgroundColor3 = Color3.fromRGB(255, 40, 40)
     barFill.BorderSizePixel = 0
     barFill.Parent = barBg
     Instance.new("UICorner", barFill).CornerRadius = UDim.new(1, 0)
 
-    -- Status text
     local status = Instance.new("TextLabel")
     status.AnchorPoint = Vector2.new(0.5, 0)
-    status.Position = UDim2.new(0.5, 0, 0.85, 0)
-    status.Size = UDim2.new(1, 0, 0, 16)
+    status.Position = UDim2.new(0.5, 0, 0.72, 0)
+    status.Size = UDim2.new(1, 0, 0, 14)
     status.BackgroundTransparency = 1
-    status.Text = "Inicializando..."
-    status.TextColor3 = Color3.fromRGB(120, 120, 130)
-    status.TextSize = 11
+    status.Text = ""
+    status.TextColor3 = Color3.fromRGB(100, 100, 115)
+    status.TextSize = 10
     status.Font = Enum.Font.Gotham
     status.TextTransparency = 1
-    status.Parent = center
+    status.Parent = c
 
-    -- ═══ ANIMAÇÕES DE ENTRADA ═══
+    local features = Instance.new("TextLabel")
+    features.AnchorPoint = Vector2.new(0.5, 0)
+    features.Position = UDim2.new(0.5, 0, 0.82, 0)
+    features.Size = UDim2.new(0.9, 0, 0, 40)
+    features.BackgroundTransparency = 1
+    features.Text = ""
+    features.TextColor3 = Color3.fromRGB(70, 70, 85)
+    features.TextSize = 9
+    features.Font = Enum.Font.Gotham
+    features.TextTransparency = 1
+    features.TextWrapped = true
+    features.Parent = c
 
-    -- Rotação do ícone
+    -- Animações
     task.spawn(function()
-        while icon and icon.Parent do
-            local t = TweenService:Create(icon, TweenInfo.new(2, Enum.EasingStyle.Linear), {
-                Rotation = icon.Rotation + 360
-            })
-            t:Play()
-            t.Completed:Wait()
+        while outer and outer.Parent do
+            pcall(function()
+                TweenService:Create(outer, TweenInfo.new(4, Enum.EasingStyle.Linear), {Rotation = outer.Rotation + 360}):Play()
+            end)
+            task.wait(4)
         end
     end)
 
-    -- Pulso do ícone
     task.spawn(function()
         while icon and icon.Parent do
-            TweenService:Create(icon, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
-                TextTransparency = 0.4
-            }):Play()
-            task.wait(0.8)
-            TweenService:Create(icon, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
-                TextTransparency = 0
-            }):Play()
-            task.wait(0.8)
+            pcall(function()
+                TweenService:Create(icon, TweenInfo.new(3, Enum.EasingStyle.Linear), {Rotation = icon.Rotation - 360}):Play()
+                TweenService:Create(icon, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {TextTransparency = 0}):Play()
+            end)
+            task.wait(1)
+            pcall(function()
+                TweenService:Create(icon, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {TextTransparency = 0.4}):Play()
+            end)
+            task.wait(1)
         end
     end)
 
-    -- Fade in dos textos
-    task.wait(0.2)
-    TweenService:Create(title, TweenInfo.new(0.5), {TextTransparency = 0}):Play()
-    task.wait(0.15)
-    TweenService:Create(ver, TweenInfo.new(0.5), {TextTransparency = 0}):Play()
-    task.wait(0.15)
-    TweenService:Create(status, TweenInfo.new(0.3), {TextTransparency = 0}):Play()
+    task.delay(0.2, function()
+        TweenService:Create(title, TweenInfo.new(0.5), {TextTransparency = 0}):Play()
+    end)
+    task.delay(0.4, function()
+        TweenService:Create(ver, TweenInfo.new(0.4), {TextTransparency = 0}):Play()
+    end)
+    task.delay(0.5, function()
+        TweenService:Create(status, TweenInfo.new(0.3), {TextTransparency = 0}):Play()
+    end)
 
-    -- Retorna controles pra atualizar
-    return {
-        Screen = screen,
-        BarFill = barFill,
-        Status = status,
-        SetProgress = function(pct, txt)
-            TweenService:Create(barFill, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
+    local ctrl = {}
+
+    function ctrl.Set(pct, txt, feat)
+        pcall(function()
+            TweenService:Create(barFill, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
                 Size = UDim2.new(math.clamp(pct, 0, 1), 0, 1, 0)
             }):Play()
-            if txt then
-                status.Text = txt
+        end)
+        if txt then status.Text = txt end
+        if feat then
+            features.Text = feat
+            if features.TextTransparency > 0.5 then
+                TweenService:Create(features, TweenInfo.new(0.3), {TextTransparency = 0}):Play()
             end
-        end,
-        Close = function()
-            status.Text = "Pronto!"
-            TweenService:Create(barFill, TweenInfo.new(0.2), {
+        end
+    end
+
+    function ctrl.Close()
+        pcall(function()
+            TweenService:Create(barFill, TweenInfo.new(0.15), {
                 Size = UDim2.new(1, 0, 1, 0),
-                BackgroundColor3 = Color3.fromRGB(50, 220, 80)
+                BackgroundColor3 = Color3.fromRGB(40, 220, 80),
             }):Play()
-            task.wait(0.6)
+        end)
+        status.Text = "✓ Pronto"
+        status.TextColor3 = Color3.fromRGB(40, 220, 80)
+        task.wait(0.6)
 
-            -- Fade out
-            TweenService:Create(bg, TweenInfo.new(0.5), {
-                BackgroundTransparency = 1
-            }):Play()
-            for _, child in ipairs(center:GetDescendants()) do
-                if child:IsA("TextLabel") then
-                    TweenService:Create(child, TweenInfo.new(0.4), {TextTransparency = 1}):Play()
-                elseif child:IsA("Frame") then
-                    TweenService:Create(child, TweenInfo.new(0.4), {BackgroundTransparency = 1}):Play()
+        pcall(function()
+            TweenService:Create(bg, TweenInfo.new(0.4), {BackgroundTransparency = 1}):Play()
+        end)
+        for _, obj in ipairs(c:GetDescendants()) do
+            pcall(function()
+                if obj:IsA("TextLabel") then
+                    TweenService:Create(obj, TweenInfo.new(0.35), {TextTransparency = 1}):Play()
+                elseif obj:IsA("Frame") then
+                    TweenService:Create(obj, TweenInfo.new(0.35), {BackgroundTransparency = 1}):Play()
                 end
-            end
-            TweenService:Create(icon, TweenInfo.new(0.4), {TextTransparency = 1}):Play()
+            end)
+        end
+        task.wait(0.5)
+        pcall(function() scr:Destroy() end)
+    end
 
-            task.wait(0.6)
-            screen:Destroy()
-        end,
-    }
+    return ctrl
 end
 
 -- ══════════════════════════════════════════════════════
--- SEQUÊNCIA DE LOADING
+-- LOADING SEQUENCE
 -- ══════════════════════════════════════════════════════
-local loader = ShowLoader()
+local s = Splash()
 
--- Etapa 1: Espera personagem
-loader.SetProgress(0.15, "Carregando personagem...")
+s.Set(0.1, "Aguardando personagem...")
 local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 char:WaitForChild("HumanoidRootPart", 15)
-task.wait(0.3)
+task.wait(0.15)
 
--- Etapa 2: Carrega módulo
-loader.SetProgress(0.45, "Carregando Lock-On System...")
-task.wait(0.4)
+s.Set(0.3, "Inicializando módulos...", "⊕ Framerate-independent camera • Exponential decay lerp")
+task.wait(0.25)
 
-local success, err = pcall(function()
-    --[[
-        OPÇÃO A: Se o script principal está como ModuleScript
-        em ReplicatedStorage, descomente a linha abaixo:
-    --]]
-    -- require(game.ReplicatedStorage:WaitForChild("LockOnSystem"))
+s.Set(0.5, "Carregando sistema de tracking...")
+task.wait(0.2)
 
-    --[[
-        OPÇÃO B: Se preferir, cole o script principal inteiro
-        aqui dentro (substitua o comentário abaixo):
-    --]]
-    -- <COLE O CONTEÚDO DO LockOnSystem.lua AQUI>
+local ok, err = pcall(function()
+    -- ════════════════════════════════════════════
+    -- DESCOMENTE PRA USAR COMO MODULE:
+    -- require(game.ReplicatedStorage:WaitForChild("LockOnSystem_v4"))
+    -- ════════════════════════════════════════════
 end)
 
-loader.SetProgress(0.7, "Inicializando sistemas...")
-task.wait(0.3)
+s.Set(0.7, "Conectando aim friction...", "◉ Threat scoring • Aim friction • Sphere cast • Orbital camera")
+task.wait(0.2)
 
-if not success and err then
-    warn("[LockOn Loader] Erro ao carregar: " .. tostring(err))
-    loader.SetProgress(0.7, "⚠ Erro — verifique o console")
+if not ok and err then
+    warn("[Loader] Erro: " .. tostring(err))
+    s.Set(0.7, "⚠ Erro — veja o console")
     task.wait(2)
-    loader.Close()
+    s.Close()
     return
 end
 
--- Etapa 3: Finaliza
-loader.SetProgress(0.9, "Conectando eventos...")
-task.wait(0.3)
-
-loader.SetProgress(1.0, "Pronto!")
+s.Set(0.85, "Ativando predição...", "Q=Lock  E=Next  R=Prev  |  Arraste o botão no mobile")
 task.wait(0.2)
 
-loader.Close()
+s.Set(1.0)
+s.Close()
 
-print("[Loader] Lock-On System carregado com sucesso!")
+print("[Loader] Lock-On v4.0 Console Grade — carregado!")
