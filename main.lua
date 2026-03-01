@@ -5,7 +5,7 @@
     ║        Mobile + PC + Gamepad | Framerate Independent      ║
     ╚══════════════════════════════════════════════════════════════╝
     
-    LocalScript → StarterPlayerScripts
+    LocalScript → Executor / StarterPlayerScripts
     
     CONTROLES:
       PC:      Q = Lock/Unlock  |  E = Próximo  |  R = Anterior
@@ -13,22 +13,10 @@
                Shift+Mouse = Orbital adjust
       Mobile:  Botão arrastável |  ◀ ▶ Trocar alvo  |  Swipe
       Gamepad: RB = Lock  |  Right Stick = Orbital  |  RS Click = Cycle
-    
-    v5.1 FIXES SOBRE v5.0:
-      ✦ FIX: CONFIG.FaceRotationRate adicionado (CRASH)
-      ✦ FIX: Strafe Hum:Move() removido (conflito com PlayerModule)
-      ✦ FIX: Soft lock redesenhado (CameraType.Custom + auto-face only)
-      ✦ FIX: Shoulder offset ANTES do sphere cast
-      ✦ FIX: Wall validation restaura auto-switch (regressão v4)
-      ✦ FIX: Damage shake usa dampened sine (não ruído branco)
-      ✦ FIX: Gradual unlock usa transparency (não Enabled toggle)
-      ✦ FIX: Variable face rate interpolação suave
-      ✦ FIX: GetAimPart cached por frame
-      ✦ FIX: FaceDuringDash removido (dead config)
 --]]
 
 -- ══════════════════════════════════════════════════════
--- SERVICES
+-- SERVICES E VARIÁVEIS SEGURAS
 -- ══════════════════════════════════════════════════════
 local Players            = game:GetService("Players")
 local RunService         = game:GetService("RunService")
@@ -37,7 +25,9 @@ local TweenService       = game:GetService("TweenService")
 
 local Camera       = workspace.CurrentCamera
 local LocalPlayer  = Players.LocalPlayer
-local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Fix para executores: aguarda o PlayerGui com timeout para evitar travamento (infinite yield)
+local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
 
 if not table.clone then
     table.clone = function(t)
@@ -55,8 +45,8 @@ local CONFIG = {
     MaxLockDistance       = 150,
     AutoLockOnHit        = true,
     AutoSwitchOnKill     = true,
-    UnlockFadeStart      = 1.2,        -- gradual unlock inicia (1.2x max range)
-    UnlockFadeFull       = 1.5,        -- unlock forçado (1.5x max range)
+    UnlockFadeStart      = 1.2,        
+    UnlockFadeFull       = 1.5,        
 
     -- ▸ Target scoring weights
     PreferFrontTargets   = true,
@@ -71,10 +61,10 @@ local CONFIG = {
 
     -- ▸ CHARACTER FACING
     AutoFaceTarget       = true,
-    FaceRotationRate     = 18,         -- [FIX #1] velocidade de rotação em movimento
-    FaceRotationIdle     = 30,         -- velocidade de rotação parado (mais rápido)
+    FaceRotationRate     = 18,         
+    FaceRotationIdle     = 30,         
 
-    -- ▸ Câmera (framerate independent) — AGRESSIVA
+    -- ▸ Câmera (framerate independent)
     CamSmoothRate        = 18,
     PredictionRate       = 12,
     VelocitySmoothRate   = 7,
@@ -82,12 +72,12 @@ local CONFIG = {
     AimLeadFactor        = 0.35,
 
     -- ▸ AAA Camera
-    CameraShoulderOffset = Vector3.new(1.5, 0, 0), -- offset à direita
+    CameraShoulderOffset = Vector3.new(1.5, 0, 0), 
     SoftLockEnabled      = true,
     DamageShakeEnabled   = true,
     DamageShakeMagnitude = 0.3,
     DamageShakeDuration  = 0.15,
-    DamageShakeFreq      = 35,         -- [FIX #6] frequência do sine shake
+    DamageShakeFreq      = 35,         
     CycleCooldown        = 0.2,
 
     -- ▸ Câmera orbital
@@ -140,9 +130,9 @@ local CONFIG = {
 -- ══════════════════════════════════════════════════════
 local State = {
     Target          = nil,
-    PendingTarget   = nil,           -- para re-lock após respawn
+    PendingTarget   = nil,           
     IsLocked        = false,
-    LockMode        = "hard",        -- "hard" ou "soft"
+    LockMode        = "hard",        
     Char            = nil,
     Hum             = nil,
     Root            = nil,
@@ -154,7 +144,7 @@ local State = {
     CachedTargetRoot = nil,
     CachedTargetHum  = nil,
     CachedTargetChar = nil,
-    CachedAimPart    = nil,          -- [FIX #9] cache do aim part
+    CachedAimPart    = nil,          
 
     TargetVelocity      = Vector3.zero,
     SmoothedPrediction  = Vector3.zero,
@@ -180,7 +170,6 @@ local State = {
     LastCycleTime      = 0,
     BufferedCycleDir   = nil,
 
-    -- [FIX #6] Shake com dampened sine
     ShakeTimer         = 0,
     ShakeStartTime     = 0,
     CameraShakeOffset  = Vector3.zero,
@@ -234,7 +223,7 @@ local function DisconnGroup(prefix)
 end
 
 -- ══════════════════════════════════════════════════════
--- TARGET PARTS — cached per frame
+-- TARGET PARTS
 -- ══════════════════════════════════════════════════════
 local function GetParts(target)
     if not target then return nil, nil, nil end
@@ -246,7 +235,6 @@ local function GetParts(target)
     return nil, nil, nil
 end
 
--- [FIX #9] Mira no UpperTorso/Torso (mais preciso que HumanoidRootPart)
 local function GetAimPart(targetChar)
     if not targetChar then return nil end
     return targetChar:FindFirstChild("UpperTorso")
@@ -261,7 +249,6 @@ local function RefreshTargetCache()
         return
     end
     State.CachedTargetChar, State.CachedTargetRoot, State.CachedTargetHum = GetParts(State.Target)
-    -- [FIX #9] Cache aim part junto (1 lookup/frame ao invés de 2-3)
     State.CachedAimPart = GetAimPart(State.CachedTargetChar)
 end
 
@@ -278,7 +265,7 @@ local function Dist(target)
 end
 
 -- ══════════════════════════════════════════════════════
--- RAYCAST — cached per frame
+-- RAYCAST
 -- ══════════════════════════════════════════════════════
 local FrameCache = { Characters = nil, FrameCount = -1 }
 local _frameCounter = 0
@@ -363,7 +350,6 @@ local function ScoreTarget(target)
     local dist = (State.Root.Position - root.Position).Magnitude
     if dist > CONFIG.MaxLockDistance then return math.huge end
 
-    -- Pré-filtro: skip raycast se alvo está atrás da câmera
     local camLook = Camera.CFrame.LookVector
     local toTarget = (root.Position - State.Root.Position)
     local dot = toTarget.Magnitude > 0.1 and camLook:Dot(toTarget.Unit) or 0
@@ -445,7 +431,6 @@ local function UpdatePrediction(dt)
     State.LastPredictionTime = now
 end
 
--- [FIX #9] Usa CachedAimPart ao invés de chamar GetAimPart repetido
 local function GetPredictedTargetPos()
     if not State.CachedTargetRoot then return Vector3.zero end
 
@@ -459,13 +444,10 @@ local function GetPredictedTargetPos()
     return basePos
 end
 
--- Forward declarations
 local LockOn, Unlock, CycleTarget
 
 -- ══════════════════════════════════════════════════════
 -- CHARACTER AUTO-FACE
--- [FIX #2] Sem Hum:Move() — strafe é natural via câmera
--- [FIX #8] Face rate interpolação suave, não binário
 -- ══════════════════════════════════════════════════════
 local function EnableAutoFace()
     if not CONFIG.AutoFaceTarget or not State.Hum then return end
@@ -484,8 +466,6 @@ local function UpdateCharacterFacing(dt)
     if not State.Root or not State.CachedTargetRoot then return end
     if not State.Hum or State.Hum.Health <= 0 then return end
 
-    -- Soft lock: só faz auto-face se for hard lock
-    -- Soft lock deixa o player livre pra virar
     if State.LockMode == "soft" then return end
 
     if State.Hum.AutoRotate then State.Hum.AutoRotate = false end
@@ -497,7 +477,6 @@ local function UpdateCharacterFacing(dt)
     if flatDir.Magnitude < 0.5 then return end
     flatDir = flatDir.Unit
 
-    -- Mistura leve com predição (80/20) pra ser responsivo sem errático
     if State.SmoothedPrediction and State.SmoothedPrediction.Magnitude > 1 then
         local predFlat = Vector3.new(State.SmoothedPrediction.X - myPos.X, 0, State.SmoothedPrediction.Z - myPos.Z)
         if predFlat.Magnitude > 0.5 then
@@ -509,8 +488,6 @@ local function UpdateCharacterFacing(dt)
         State.SmoothedFaceDir = State.Root.CFrame.LookVector
     end
 
-    -- [FIX #8] Taxa variável com INTERPOLAÇÃO suave baseada em moveMag
-    -- Parado = FaceRotationIdle (30, rápido), correndo = FaceRotationRate (18, suave)
     local moveMag = math.clamp(State.Hum.MoveDirection.Magnitude, 0, 1)
     local faceRate = CONFIG.FaceRotationIdle + (CONFIG.FaceRotationRate - CONFIG.FaceRotationIdle) * moveMag
 
@@ -521,18 +498,12 @@ local function UpdateCharacterFacing(dt)
     if typeof(newDir) == "Vector3" and newDir.Magnitude > 0.1 then
         newDir = Vector3.new(newDir.X, 0, newDir.Z).Unit
         State.SmoothedFaceDir = newDir
-        -- Aplica rotação mantendo posição
         State.Root.CFrame = CFrame.lookAt(State.Root.Position, State.Root.Position + newDir)
     end
-
-    -- [FIX #2] NÃO chama Hum:Move() — o PlayerModule já faz isso.
-    -- Com CameraType.Scriptable + AutoRotate=false, WASD já é relativo
-    -- à câmera que aponta pro alvo. Strafe é NATURAL.
 end
 
 -- ══════════════════════════════════════════════════════
 -- WALL VALIDATION
--- [FIX #5] Restaura auto-switch do v4
 -- ══════════════════════════════════════════════════════
 local function UpdateWallValidation(dt)
     if not State.IsLocked or not State.CachedTargetRoot or not State.Root then
@@ -557,11 +528,11 @@ local function UpdateWallValidation(dt)
         State.WallLossTimer = State.WallLossTimer + elapsed
 
         if State.WallLossTimer >= CONFIG.WallLossTimeout then
-            -- [FIX #5] Auto-switch antes de unlock (restaurado do v4)
             if CONFIG.AutoSwitchOnKill then
-                local next = FindBestTarget()
-                if next and next ~= State.Target then
-                    LockOn(next)
+                -- Correção Delta: Alterado de "next" para "nextTarget" para evitar shadow da funçao next do Lua
+                local nextTarget = FindBestTarget()
+                if nextTarget and nextTarget ~= State.Target then
+                    LockOn(nextTarget)
                 else
                     Unlock()
                 end
@@ -574,7 +545,6 @@ end
 
 -- ══════════════════════════════════════════════════════
 -- DAMAGE CAMERA SHAKE
--- [FIX #6] Dampened sine ao invés de ruído branco
 -- ══════════════════════════════════════════════════════
 local function TriggerShake()
     if not CONFIG.DamageShakeEnabled or not State.IsLocked then return end
@@ -592,8 +562,7 @@ local function UpdateShake(dt)
     local elapsed = tick() - State.ShakeStartTime
     local duration = CONFIG.DamageShakeDuration
 
-    -- Dampened sine: amplitude decai exponencialmente, direção oscila suavemente
-    local decay = math.exp(-elapsed / duration * 3) -- envelope de decay
+    local decay = math.exp(-elapsed / duration * 3)
     local freq = CONFIG.DamageShakeFreq
     local mag = CONFIG.DamageShakeMagnitude * decay
 
@@ -606,7 +575,6 @@ end
 
 -- ══════════════════════════════════════════════════════
 -- 3D INDICATOR
--- [FIX #7] Gradual unlock usa transparency, não Enabled toggle
 -- ══════════════════════════════════════════════════════
 local function DestroyIndicator()
     if State.Indicator then
@@ -691,28 +659,24 @@ local function CreateIndicator(targetRoot, fadeIn)
         Instance.new("UICorner", arrow).CornerRadius = UDim.new(0, 2)
     end
 
-    -- Dead flag pra parar loops quando destruído
     bb:GetPropertyChangedSignal("Parent"):Connect(function()
         if not bb.Parent then bb:SetAttribute("_dead", true) end
     end)
 
-    -- Pulse animation
     task.spawn(function()
         local expanding = false
         while not bb:GetAttribute("_dead") do
             local szA = expanding and UDim2.new(0.95, 0, 0.95, 0) or UDim2.new(0.72, 0, 0.72, 0)
             local szD = expanding and UDim2.new(0.1, 0, 0.1, 0) or UDim2.new(0.06, 0, 0.06, 0)
-            local ok = pcall(function()
+            pcall(function()
                 TweenService:Create(arrowHolder, TweenInfo.new(0.65, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Size = szA}):Play()
                 TweenService:Create(dot, TweenInfo.new(0.65, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Size = szD}):Play()
             end)
-            if not ok then break end
             expanding = not expanding
             task.wait(0.65)
         end
     end)
 
-    -- LOS indicator: escurece atrás de parede
     task.spawn(function()
         while not bb:GetAttribute("_dead") do
             local transp = State.HasLineOfSight and 0.15 or 0.55
@@ -723,7 +687,6 @@ local function CreateIndicator(targetRoot, fadeIn)
         end
     end)
 
-    -- Fade-in na troca de alvo
     if fadeIn then
         ring.Size = UDim2.new(0.9, 0, 0.9, 0)
         ring.BackgroundTransparency = 0.9
@@ -755,14 +718,11 @@ local function FlashSwitchFeedback()
     end
 end
 
--- [FIX #7] Gradual unlock: indica via transparency suave (não on/off blink)
 local function UpdateIndicatorFade(fadeMult)
     if not State.Indicator then return end
-    -- fadeMult vai de 1 (normal) a 0 (quase unlock)
-    -- Quando perto do limite, ring pulsa suavemente entre opaco e translúcido
     if fadeMult < 1 then
-        local pulse = 0.5 + 0.5 * math.sin(tick() * 8)  -- oscila suave
-        local transp = 0.15 + (1 - fadeMult) * pulse * 0.5  -- mais translúcido perto do limite
+        local pulse = 0.5 + 0.5 * math.sin(tick() * 8) 
+        local transp = 0.15 + (1 - fadeMult) * pulse * 0.5  
         for _, child in ipairs(State.Indicator:GetDescendants()) do
             if child.Name == "Ring" and child:IsA("Frame") then
                 pcall(function()
@@ -780,6 +740,7 @@ end
 local UI = {}
 
 local function BuildUI()
+    if not PlayerGui then return end
     local old = PlayerGui:FindFirstChild("LockOnUI_v5")
     if old then old:Destroy() end
 
@@ -790,7 +751,6 @@ local function BuildUI()
     screen.DisplayOrder = 10
     screen.Parent = PlayerGui
 
-    -- ═══ DRAGGABLE BUTTON CONTAINER ═══
     local btnFrame = Instance.new("Frame")
     btnFrame.Name = "DragContainer"
     btnFrame.Size = UDim2.new(0, CONFIG.ButtonSize + 10, 0, CONFIG.ButtonSize + 70)
@@ -839,7 +799,6 @@ local function BuildUI()
     lockLbl.Font = Enum.Font.GothamBold
     lockLbl.Parent = lockBtn
 
-    -- Drag system
     local dragging, dragStart, startPos, totalDist = false, nil, nil, 0
     lockBtn.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -873,7 +832,6 @@ local function BuildUI()
         end
     end)
 
-    -- Switch buttons
     local switchCont = Instance.new("Frame")
     switchCont.Name = "Switch"
     switchCont.AnchorPoint = Vector2.new(0.5, 0)
@@ -904,7 +862,6 @@ local function BuildUI()
     local leftBtn = MakeSwitchBtn("Left", "◀", 0)
     local rightBtn = MakeSwitchBtn("Right", "▶", UDim.new(1, -48))
 
-    -- Info panel
     local infoPanel = Instance.new("Frame")
     infoPanel.Name = "TargetInfo"
     infoPanel.AnchorPoint = Vector2.new(0.5, 0)
@@ -1041,17 +998,14 @@ local function UpdateTargetInfo()
     UI.NameLabel.Text = State.Target.DisplayName or State.Target.Name
     UI.DistLabel.Text = math.floor(Dist(State.Target)) .. "m"
 
-    -- LOS dot
     local losColor = State.HasLineOfSight and Color3.fromRGB(40, 220, 80) or Color3.fromRGB(255, 180, 30)
     pcall(function() TweenService:Create(UI.LOSDot, TweenInfo.new(0.2), {BackgroundColor3 = losColor}):Play() end)
 
-    -- HP bar
     local pct = math.clamp(State.CachedTargetHum.Health / State.CachedTargetHum.MaxHealth, 0, 1)
     pcall(function()
         TweenService:Create(UI.HPFill, TweenInfo.new(0.15), {Size = UDim2.new(pct, 0, 1, 0)}):Play()
     end)
 
-    -- Ghost bar (delay de dano)
     if pct < lastHP - 0.01 then
         task.delay(0.4, function()
             pcall(function()
@@ -1065,7 +1019,6 @@ local function UpdateTargetInfo()
     end
     lastHP = pct
 
-    -- Cor HP
     local color
     if pct > 0.6 then     color = Color3.fromRGB(40, 220, 80)
     elseif pct > 0.3 then color = Color3.fromRGB(245, 200, 30)
@@ -1143,7 +1096,6 @@ LockOn = function(target)
     lastHP = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
     if UI.HPGhost then UI.HPGhost.Size = UDim2.new(lastHP, 0, 1, 0) end
 
-    -- [FIX #3] Hard lock = Scriptable, Soft lock = Custom (sem conflito)
     if State.LockMode == "hard" then
         Camera.CameraType = Enum.CameraType.Scriptable
     else
@@ -1152,7 +1104,6 @@ LockOn = function(target)
 
     EnableAutoFace()
 
-    -- FOV inicial
     local dist = (State.Root.Position - root.Position).Magnitude
     local fovT = math.clamp((dist - CONFIG.FOVCloseDistance) / (CONFIG.FOVFarDistance - CONFIG.FOVCloseDistance), 0, 1)
     local targetFOV = CONFIG.FOVClose + (CONFIG.FOVFar - CONFIG.FOVClose) * fovT
@@ -1165,40 +1116,40 @@ LockOn = function(target)
     if isSwitching then FlashSwitchFeedback() end
     UpdateButtonVisual()
 
-    -- Monitor morte do alvo
     Conn("TargetDied", hum.Died:Connect(function()
         if State.Target ~= target then return end
         task.defer(function()
             if CONFIG.AutoSwitchOnKill then
-                local next = FindBestTarget()
-                if next then LockOn(next) else Unlock() end
+                -- Correção Delta: Variável renomeada
+                local nextTarget = FindBestTarget()
+                if nextTarget then LockOn(nextTarget) else Unlock() end
             else
                 Unlock()
             end
         end)
     end))
 
-    -- Monitor saída do alvo
     Conn("TargetLeft", Players.PlayerRemoving:Connect(function(p)
         if p ~= target then return end
         task.defer(function()
             if CONFIG.AutoSwitchOnKill then
-                local next = FindBestTarget()
-                if next then LockOn(next) else Unlock() end
+                -- Correção Delta: Variável renomeada
+                local nextTarget = FindBestTarget()
+                if nextTarget then LockOn(nextTarget) else Unlock() end
             else
                 Unlock()
             end
         end)
     end))
 
-    -- Monitor respawn do alvo
     Conn("TargetCharRemoved", target.CharacterRemoving:Connect(function()
         if State.Target ~= target then return end
         task.delay(0.3, function()
             if State.Target == target and not Alive(target) then
                 if CONFIG.AutoSwitchOnKill then
-                    local next = FindBestTarget()
-                    if next then LockOn(next) else Unlock() end
+                    -- Correção Delta: Variável renomeada
+                    local nextTarget = FindBestTarget()
+                    if nextTarget then LockOn(nextTarget) else Unlock() end
                 else
                     Unlock()
                 end
@@ -1210,7 +1161,6 @@ end
 CycleTarget = function(direction)
     if not State.IsLocked then return end
 
-    -- Input buffering cooldown
     local now = tick()
     if now - State.LastCycleTime < CONFIG.CycleCooldown then
         State.BufferedCycleDir = direction
@@ -1221,7 +1171,6 @@ CycleTarget = function(direction)
     local targets = GetScoredTargets()
     if #targets <= 1 then return end
 
-    -- Directional switch: pega alvo na direção do swipe/input
     if State.CachedTargetRoot then
         local currentPos2D = Camera:WorldToScreenPoint(State.CachedTargetRoot.Position)
         local bestTarget, bestScore = nil, math.huge
@@ -1233,7 +1182,6 @@ CycleTarget = function(direction)
                     local pos2D, onScr = Camera:WorldToScreenPoint(root.Position)
                     if onScr then
                         local dx = pos2D.X - currentPos2D.X
-                        -- Só aceita alvos na direção certa (direita ou esquerda)
                         if (direction > 0 and dx > 10) or (direction < 0 and dx < -10) then
                             local dist = math.abs(dx) + math.abs(pos2D.Y - currentPos2D.Y) * 2
                             if dist < bestScore then
@@ -1252,7 +1200,6 @@ CycleTarget = function(direction)
         end
     end
 
-    -- Fallback: ciclo simples por score
     local idx = 0
     for i, t in ipairs(targets) do
         if t.Target == State.Target then idx = i; break end
@@ -1307,7 +1254,8 @@ local function ApplyAimFriction(dt)
     end
 end
 
-game:BindToClose(ResetAimFriction)
+-- Fix para executores: Protege o BindToClose num pcall (evita falhas catastróficas ao ejetar scripts)
+pcall(game.BindToClose, game, ResetAimFriction)
 
 -- ══════════════════════════════════════════════════════
 -- HIT DETECTION & DAMAGE
@@ -1325,10 +1273,8 @@ local function SetupDamageDetection()
     local lastHealth = State.Hum.Health
     Conn("DamageTaken", State.Hum.HealthChanged:Connect(function(newHealth)
         if newHealth < lastHealth then
-            -- [FIX #6] Trigger shake com dampened sine
             TriggerShake()
 
-            -- Registra atacante mais próximo
             local nearest, nearestDist = nil, 25
             for _, player in ipairs(Players:GetPlayers()) do
                 if player ~= LocalPlayer and Alive(player) then
@@ -1371,7 +1317,6 @@ local function UpdateOrbital(dt)
     if not CONFIG.OrbitalEnabled then return end
     if not State.IsLocked then State.OrbitalOffset = 0; return end
 
-    -- Gamepad right stick
     local ok, gamepadInput = pcall(UserInputService.GetGamepadState, UserInputService, Enum.UserInputType.Gamepad1)
     if ok and gamepadInput then
         for _, obj in ipairs(gamepadInput) do
@@ -1382,11 +1327,9 @@ local function UpdateOrbital(dt)
     end
 
     State.OrbitalOffset = math.clamp(State.OrbitalOffset, -CONFIG.OrbitalMaxAngle, CONFIG.OrbitalMaxAngle)
-    -- Decay suave de volta ao centro
     State.OrbitalOffset = SafeLerp(State.OrbitalOffset, 0, ExpDecay(CONFIG.OrbitalDecayRate, dt) * 0.3)
 end
 
--- Mouse orbital: shift + mouse move
 Conn("MouseOrbital", UserInputService.InputChanged:Connect(function(input)
     if not State.IsLocked or not CONFIG.OrbitalEnabled then return end
     if input.UserInputType == Enum.UserInputType.MouseMovement then
@@ -1403,10 +1346,8 @@ end))
 local function UpdateCamera(dt)
     _frameCounter = _frameCounter + 1
 
-    -- Aim friction (roda sempre, mesmo sem lock)
     ApplyAimFriction(dt)
 
-    -- Input buffer: processa cycle bufferizado
     if State.BufferedCycleDir and tick() - State.LastCycleTime >= CONFIG.CycleCooldown then
         local dir = State.BufferedCycleDir
         State.BufferedCycleDir = nil
@@ -1420,21 +1361,17 @@ local function UpdateCamera(dt)
 
     UpdateWallValidation(dt)
 
-    -- ═══ GRADUAL DISTANCE UNLOCK ═══
     local dist = (State.Root.Position - State.CachedTargetRoot.Position).Magnitude
     local maxDist = CONFIG.MaxLockDistance
 
-    -- Unlock forçado
     if dist > maxDist * CONFIG.UnlockFadeFull then Unlock(); return end
 
-    -- Fade multiplier: 1 = normal, 0 = quase unlock
     local fadeMult = 1
     if dist > maxDist * CONFIG.UnlockFadeStart then
         fadeMult = 1 - (dist - maxDist * CONFIG.UnlockFadeStart) / (maxDist * (CONFIG.UnlockFadeFull - CONFIG.UnlockFadeStart))
         fadeMult = math.clamp(fadeMult, 0, 1)
     end
 
-    -- [FIX #7] Indicator fade gradual (não on/off toggle)
     UpdateIndicatorFade(fadeMult)
 
     UpdatePrediction(dt)
@@ -1442,16 +1379,13 @@ local function UpdateCamera(dt)
     UpdateOrbital(dt)
     UpdateShake(dt)
 
-    -- [FIX #3] Soft lock: só faz auto-face + indicator, câmera é livre
     if State.LockMode == "soft" then
         UpdateTargetInfo()
         return
     end
 
-    -- ═══ HARD LOCK CAMERA (Scriptable) ═══
     local playerPos = State.Root.Position
 
-    -- [FIX #9] Usa CachedAimPart
     local aimPos = State.CachedAimPart and State.CachedAimPart.Position
         or (State.CachedTargetRoot.Position + Vector3.new(0, 2, 0))
     local predictedTarget = GetPredictedTargetPos()
@@ -1461,25 +1395,19 @@ local function UpdateCamera(dt)
     if flatDir.Magnitude < 0.5 then return end
     flatDir = flatDir.Unit
 
-    -- Orbital offset
     local adjustedDir = (CFrame.Angles(0, State.OrbitalOffset, 0) * CFrame.new(Vector3.zero, flatDir)).LookVector
 
-    -- Posição base da câmera
     local camGoal = playerPos
         - adjustedDir * CONFIG.CameraDistance
         + Vector3.new(0, CONFIG.CameraHeight, 0)
 
-    -- Ponto de foco com predição
     local focusPoint = playerPos:Lerp(predictedTarget, CONFIG.LookAtBias)
 
-    -- [FIX #4] Shoulder offset ANTES do sphere cast
     local tempCF = CFrame.lookAt(camGoal, focusPoint)
     camGoal = camGoal + tempCF.RightVector * CONFIG.CameraShoulderOffset.X
 
-    -- Shake
     camGoal = camGoal + State.CameraShakeOffset
 
-    -- SPHERE CAST anti-wall (4 raycasts) — DEPOIS do shoulder offset
     local wallHit = SphereCast(playerPos + Vector3.new(0, 2, 0), camGoal, 0.5, GetAllCharactersCached())
     if wallHit then
         camGoal = wallHit.Position + wallHit.Normal * 0.9
@@ -1488,14 +1416,11 @@ local function UpdateCamera(dt)
         end
     end
 
-    -- Goal CFrame final
     local goalCF = CFrame.lookAt(camGoal, focusPoint)
 
-    -- Camera smoothing com fade (mais lento perto do limite de range)
     local camAlpha = ExpDecay(CONFIG.CamSmoothRate * fadeMult, dt)
     Camera.CFrame = SafeLerp(Camera.CFrame, goalCF, camAlpha)
 
-    -- FOV dinâmico
     local fovT = math.clamp((dist - CONFIG.FOVCloseDistance) / (CONFIG.FOVFarDistance - CONFIG.FOVCloseDistance), 0, 1)
     local targetFOV = CONFIG.FOVClose + (CONFIG.FOVFar - CONFIG.FOVClose) * fovT
     State.CurrentFOV = SafeLerp(State.CurrentFOV, targetFOV, ExpDecay(CONFIG.FOVSmoothRate, dt))
@@ -1516,14 +1441,13 @@ local function OnCharacter(char)
     State.Root = char:WaitForChild("HumanoidRootPart", 10)
 
     if not State.Hum or not State.Root then
-        warn("[LockOn v5.1] Humanoid/RootPart não encontrado")
         return
     end
 
     if State.IsLocked then Unlock() end
 
     Conn("SelfDied", State.Hum.Died:Connect(function()
-        State.PendingTarget = State.Target  -- salva pra re-lock
+        State.PendingTarget = State.Target 
         DisableAutoFace()
         Unlock()
     end))
@@ -1533,7 +1457,6 @@ local function OnCharacter(char)
             SetupHitDetection(char)
             SetupDamageDetection()
 
-            -- Re-lock após respawn (se alvo ainda vivo e no range)
             if State.PendingTarget and Alive(State.PendingTarget) then
                 if Dist(State.PendingTarget) <= CONFIG.MaxLockDistance then
                     LockOn(State.PendingTarget)
@@ -1560,7 +1483,6 @@ UserInputService.InputBegan:Connect(function(input, processed)
         end
 
     elseif key == CONFIG.SoftLockKey then
-        -- Toggle hard/soft
         State.LockMode = State.LockMode == "hard" and "soft" or "hard"
         if State.IsLocked then
             if State.LockMode == "hard" then
@@ -1578,7 +1500,6 @@ UserInputService.InputBegan:Connect(function(input, processed)
     end
 end)
 
--- Touch swipe
 UserInputService.TouchStarted:Connect(function(touch, processed)
     if processed or not State.IsLocked then return end
     if touch.Position.Y < Camera.ViewportSize.Y * 0.4 then
@@ -1610,17 +1531,18 @@ local function Init()
     BuildUI()
     UpdateButtonVisual()
 
-    UI.LockBtn.MouseButton1Click:Connect(function()
-        if State.ButtonDragging then return end
-        if State.IsLocked then Unlock()
-        else
-            local t = FindBestTarget()
-            if t then LockOn(t) end
-        end
-    end)
-
-    UI.LeftBtn.MouseButton1Click:Connect(function() CycleTarget(-1) end)
-    UI.RightBtn.MouseButton1Click:Connect(function() CycleTarget(1) end)
+    if UI.LockBtn then
+        UI.LockBtn.MouseButton1Click:Connect(function()
+            if State.ButtonDragging then return end
+            if State.IsLocked then Unlock()
+            else
+                local t = FindBestTarget()
+                if t then LockOn(t) end
+            end
+        end)
+    end
+    if UI.LeftBtn then UI.LeftBtn.MouseButton1Click:Connect(function() CycleTarget(-1) end) end
+    if UI.RightBtn then UI.RightBtn.MouseButton1Click:Connect(function() CycleTarget(1) end) end
 
     if LocalPlayer.Character then
         task.spawn(function() OnCharacter(LocalPlayer.Character) end)
@@ -1635,23 +1557,6 @@ local function Init()
             Unlock()
         end
     end)
-
-    print("══════════════════════════════════════════════")
-    print("  LOCK-ON SYSTEM v5.1 CHASE GRADE — ATIVO")
-    print("  PC:     Q=Lock  E=Next  R=Prev  T=Soft/Hard")
-    print("          Shift+Mouse = Orbital adjust")
-    print("  Mobile: Arraste botão | ◀ ▶ | Swipe")
-    print("  Gamepad: RB=Lock  RS=Cycle  RStick=Orbital")
-    print("")
-    print("  ✦ Auto-face com rotação suave")
-    print("  ✦ Strafe natural (sem Hum:Move hack)")
-    print("  ✦ Soft/Hard lock toggle")
-    print("  ✦ Shoulder offset + Vertical aim")
-    print("  ✦ Directional target switch")
-    print("  ✦ Dampened sine shake")
-    print("  ✦ Gradual unlock com fade")
-    print("  ✦ Re-lock após respawn")
-    print("══════════════════════════════════════════════")
 end
 
 Init()
