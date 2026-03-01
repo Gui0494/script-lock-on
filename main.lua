@@ -41,6 +41,14 @@ local Camera       = workspace.CurrentCamera
 local LocalPlayer  = Players.LocalPlayer
 local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
 
+if not table.clone then
+    table.clone = function(t)
+        local copy = {}
+        for k, v in pairs(t) do copy[k] = v end
+        return copy
+    end
+end
+
 -- ══════════════════════════════════════════════════════
 -- CONFIG
 -- ══════════════════════════════════════════════════════
@@ -176,7 +184,8 @@ local function SafeLerp(a, b, alpha)
         return a:Lerp(b, alpha)
     elseif typeof(a) == "CFrame" then
         return a:Lerp(b, alpha)
-    elseif typeof(a) == "number" then
+    end
+    if typeof(a) == "number" then
         return a + (b - a) * alpha
     end
     return b
@@ -505,6 +514,9 @@ local function GetPredictedTargetPos()
 
     return basePos
 end
+
+-- Forward declarations (DEVE ficar antes de qualquer função que use elas)
+local LockOn, Unlock, CycleTarget
 
 -- ══════════════════════════════════════════════════════
 -- WALL VALIDATION — timer antes de unlock
@@ -1057,9 +1069,6 @@ end
 -- LOCK / UNLOCK / CYCLE
 -- ══════════════════════════════════════════════════════
 
--- Forward declarations
-local LockOn, Unlock, CycleTarget
-
 Unlock = function()
     local hadTarget = State.Target ~= nil
 
@@ -1260,7 +1269,7 @@ local function ApplyAimFriction(dt)
 end
 
 -- Safety net: garante reset se o script crashar
-game:BindToClose(ResetAimFriction)
+pcall(game.BindToClose, game, ResetAimFriction)
 
 -- ══════════════════════════════════════════════════════
 -- AUTO-LOCK HIT DETECTION
@@ -1348,8 +1357,8 @@ local function UpdateOrbital(dt)
     end
 
     -- Gamepad right stick
-    local gamepadInput = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)
-    if gamepadInput then
+    local ok, gamepadInput = pcall(UserInputService.GetGamepadState, UserInputService, Enum.UserInputType.Gamepad1)
+    if ok and gamepadInput then
         for _, obj in ipairs(gamepadInput) do
             if obj.KeyCode == Enum.KeyCode.Thumbstick2 then
                 local x = obj.Position.X
