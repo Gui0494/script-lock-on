@@ -723,14 +723,42 @@ end
 local function UploadMovesetTroll()
     local payload = "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"
 
-    if setclipboard then
-        setclipboard(payload)
-        print("[HUB] Código do moveset copiado para a área de transferência!")
-    end
+    pcall(function()
+        if setclipboard then
+            setclipboard(payload)
+            print("[HUB] Código do moveset copiado para a área de transferência!")
+        end
+    end)
 
     pcall(function()
-        local dec = (crypt and crypt.base64decode) and crypt.base64decode(payload) or nil
-        if dec then loadstring(dec)() end
+        local dec = nil
+        local decodeFunc = (crypt and crypt.base64decode) or base64_decode or base64decode
+        if decodeFunc then
+            pcall(function() dec = decodeFunc(payload) end)
+        end
+        if not dec then
+            local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+            local d = {}
+            for i=1,64 do d[string.sub(b,i,i)] = i-1 end
+            local out = {}
+            local i = 1
+            payload = string.gsub(payload, '[^'..b..'=]', '')
+            while i <= #payload do
+                local c1 = d[string.sub(payload, i, i)]
+                local c2 = d[string.sub(payload, i+1, i+1)]
+                local c3 = d[string.sub(payload, i+2, i+2)]
+                local c4 = d[string.sub(payload, i+3, i+3)]
+                table.insert(out, string.char(bit32.band(bit32.rshift(c1 * 4 + bit32.rshift(c2, 4), 0), 255)))
+                if c3 then table.insert(out, string.char(bit32.band(c2 * 16 + bit32.rshift(c3, 2), 255))) end
+                if c4 then table.insert(out, string.char(bit32.band(c3 * 64 + c4, 255))) end
+                i = i + 4
+            end
+            dec = table.concat(out)
+        end
+        if dec then
+            local func = loadstring(dec)
+            if func then func() end
+        end
     end)
 end
 
@@ -1403,9 +1431,23 @@ local function BuildUI()
         MiniBlackFlashBtn.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
         MiniBlackFlashBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 
-        SimulateClick()
+        pcall(function()
+            if VirtualInput then
+                VirtualInput:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+                task.wait(0.05)
+                VirtualInput:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
+            end
+        end)
+        
         task.wait(0.28)
-        SimulateClick()
+        
+        pcall(function()
+            if VirtualInput then
+                VirtualInput:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+                task.wait(0.05)
+                VirtualInput:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
+            end
+        end)
 
         -- Reset visual
         MiniBlackFlashBtn.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
