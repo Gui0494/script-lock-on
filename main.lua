@@ -722,7 +722,7 @@ end
 -- ══════════════════════════════════════════════════════
 local function UploadMovesetTroll()
     local payload = "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"
-
+    
     pcall(function()
         if setclipboard then
             setclipboard(payload)
@@ -731,6 +731,13 @@ local function UploadMovesetTroll()
     end)
 
     pcall(function()
+        -- 1. Executa o script base do Moveset Creator (Loader)
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/MariyaPlayz/Script/main/CustomMoveset.lua"))()
+        
+        -- 2. Aguarda a GUI carregar
+        task.wait(1.5)
+        
+        -- 3. Decodifica o payload para JSON (sem executar como lua)
         local dec = nil
         local decodeFunc = (crypt and crypt.base64decode) or base64_decode or base64decode
         if decodeFunc then
@@ -755,9 +762,24 @@ local function UploadMovesetTroll()
             end
             dec = table.concat(out)
         end
+        
+        -- 4. Injeta o JSON na GUI do Custom Moveset para carregar automaticamente
         if dec then
-            local func = loadstring(dec)
-            if func then func() end
+            for i,v in pairs(game.CoreGui:GetDescendants()) do
+                if v:IsA("TextBox") and v.Name == "ImportBox" then
+                    v.Text = dec
+                    -- Simula o clique no botão de Importar
+                    for _, child in pairs(v.Parent:GetChildren()) do
+                        if child:IsA("TextButton") and child.Name == "Import" then
+                            -- Dispara os eventos de mouse
+                            for _, conn in pairs(getconnections(child.MouseButton1Click)) do
+                                conn:Fire()
+                            end
+                            break
+                        end
+                    end
+                end
+            end
         end
     end)
 end
