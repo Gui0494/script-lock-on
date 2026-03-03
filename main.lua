@@ -767,61 +767,7 @@ local function UploadMovesetTroll()
         end
     end)
 end
-    end)
 
-    pcall(function()
-        -- 1. Executa o script base do Moveset Creator (Loader)
-        loadstring(game:HttpGet("https://raw.githubusercontent.com/MariyaPlayz/Script/main/CustomMoveset.lua"))()
-        
-        -- 2. Aguarda a GUI carregar
-        task.wait(1.5)
-        
-        -- 3. Decodifica o payload para JSON (sem executar como lua)
-        local dec = nil
-        local decodeFunc = (crypt and crypt.base64decode) or base64_decode or base64decode
-        if decodeFunc then
-            pcall(function() dec = decodeFunc(payload) end)
-        end
-        if not dec then
-            local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-            local d = {}
-            for i=1,64 do d[string.sub(b,i,i)] = i-1 end
-            local out = {}
-            local i = 1
-            payload = string.gsub(payload, '[^'..b..'=]', '')
-            while i <= #payload do
-                local c1 = d[string.sub(payload, i, i)]
-                local c2 = d[string.sub(payload, i+1, i+1)]
-                local c3 = d[string.sub(payload, i+2, i+2)]
-                local c4 = d[string.sub(payload, i+3, i+3)]
-                table.insert(out, string.char(bit32.band(bit32.rshift(c1 * 4 + bit32.rshift(c2, 4), 0), 255)))
-                if c3 then table.insert(out, string.char(bit32.band(c2 * 16 + bit32.rshift(c3, 2), 255))) end
-                if c4 then table.insert(out, string.char(bit32.band(c3 * 64 + c4, 255))) end
-                i = i + 4
-            end
-            dec = table.concat(out)
-        end
-        
-        -- 4. Injeta o JSON na GUI do Custom Moveset para carregar automaticamente
-        if dec then
-            for i,v in pairs(game.CoreGui:GetDescendants()) do
-                if v:IsA("TextBox") and v.Name == "ImportBox" then
-                    v.Text = dec
-                    -- Simula o clique no botão de Importar
-                    for _, child in pairs(v.Parent:GetChildren()) do
-                        if child:IsA("TextButton") and child.Name == "Import" then
-                            -- Dispara os eventos de mouse
-                            for _, conn in pairs(getconnections(child.MouseButton1Click)) do
-                                conn:Fire()
-                            end
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end)
-end
 
 -- ══════════════════════════════════════════════════════
 -- FORWARD DECLARATIONS
@@ -1494,11 +1440,7 @@ local function BuildUI()
 
         local function Press3()
             pcall(function()
-                if keypress and keyrelease then
-                    keypress(0x33)
-                    task.wait(0.05)
-                    keyrelease(0x33)
-                elseif VirtualInput then
+                if VirtualInput then
                     VirtualInput:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
                     task.wait(0.05)
                     VirtualInput:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
