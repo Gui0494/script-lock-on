@@ -1,8 +1,8 @@
 --[[
     ╔══════════════════════════════════════════════════════════════╗
-    ║        LOCK-ON TARGET SYSTEM v6.1 — FULL FIX & POLISH       ║
-    ║        Auto-Face • Dash Tracking • Sticky Camera             ║
-    ║        FPS Optimizer • Auto Black Flash • Troll Moveset      ║
+    ║        LOCK-ON TARGET SYSTEM v6.2 — COMBAT FIXES            ║
+    ║        Menu Toggle • UI Clamp • Câmera Estável               ║
+    ║        Fix Morte • Auto-Lock Toggle • Seta 2v1               ║
     ╚══════════════════════════════════════════════════════════════════╝
     
     LocalScript → Executor / StarterPlayerScripts
@@ -84,6 +84,7 @@ local CONFIG = {
     -- ▸ AAA Camera
     CameraShoulderOffset = Vector3.new(1.5, 0, 0),
     SoftLockEnabled      = true,
+    CameraMaxStep        = 14,   -- studs máximos que a câmera anda por frame (anti-teleporte)
     DamageShakeEnabled   = true,
     DamageShakeMagnitude = 0.3,
     DamageShakeDuration  = 0.15,
@@ -124,6 +125,18 @@ local CONFIG = {
     SwipeThreshold       = 55,
     SwipeTimeout         = 0.3,
     DragThreshold        = 8,
+
+    -- ▸ Menu / UI
+    MenuToggleSize       = 46,
+    DefaultMenuTogglePos = UDim2.new(0.02, 0, 0.2, 0),
+    DefaultHubPos        = UDim2.new(0.02, 0, 0.3, 0),
+    DefaultBFPos         = UDim2.new(0.5, -32, 0.7, 0),
+    MenuOpenDefault      = false,
+    ViewportMargin       = 24,   -- mínimo de pixels visíveis ao clampar
+
+    -- ▸ 2v1 (seta no segundo atacante)
+    SecondThreatTimeout  = 3.0,  -- segundos sem novo dano antes de sumir a seta
+    SecondThreatRange    = 120,  -- distância máxima pra considerar segundo atacante
 }
 
 -- ══════════════════════════════════════════════════════
@@ -173,6 +186,17 @@ local State = {
     -- Mobile swipe
     SwipeStart           = nil,
     SwipeStartTime       = 0,
+
+    -- UI
+    MenuOpen             = false,
+    SavedMenuTogglePos   = nil,
+    SavedHubPos          = nil,
+    SavedBFPos           = nil,
+
+    -- 2v1 second-attacker arrow
+    SecondThreat         = nil,
+    SecondThreatTime     = 0,
+    ThreatArrow          = nil,
 }
 
 -- ══════════════════════════════════════════════════════
@@ -197,6 +221,13 @@ end
 local function InverseLerp(min, max, value)
     if max - min == 0 then return 0 end
     return math.clamp((value - min) / (max - min), 0, 1)
+end
+
+-- Detecta NaN / inf num Vector3 (evita CFrame inválido travando a câmera)
+local function IsFiniteVec(v)
+    if typeof(v) ~= "Vector3" then return false end
+    return v.X == v.X and v.Y == v.Y and v.Z == v.Z
+        and v.Magnitude < math.huge
 end
 
 -- ══════════════════════════════════════════════════════
@@ -626,6 +657,37 @@ end
 -- ══════════════════════════════════════════════════════
 -- UI UTILITIES
 -- ══════════════════════════════════════════════════════
+-- Mantém um GuiObject dentro do viewport (≥ ViewportMargin px visíveis)
+local function ClampToViewport(frame)
+    if not frame or not frame.Parent then return end
+    local vp = Camera.ViewportSize
+    if vp.X <= 0 or vp.Y <= 0 then return end
+
+    local absSize = frame.AbsoluteSize
+    local absPos = frame.AbsolutePosition
+    local margin = CONFIG.ViewportMargin
+
+    -- limites: pelo menos `margin` px do frame sempre visíveis nas duas direções
+    local minX = -absSize.X + margin
+    local maxX = vp.X - margin
+    local minY = -absSize.Y + margin
+    local maxY = vp.Y - margin
+
+    local clampedX = math.clamp(absPos.X, minX, maxX)
+    local clampedY = math.clamp(absPos.Y, minY, maxY)
+
+    if clampedX ~= absPos.X or clampedY ~= absPos.Y then
+        -- converte de volta pra offset absoluto, descontando a escala atual
+        local pos = frame.Position
+        local scaleOffsetX = pos.X.Scale * vp.X
+        local scaleOffsetY = pos.Y.Scale * vp.Y
+        frame.Position = UDim2.new(
+            pos.X.Scale, clampedX - scaleOffsetX,
+            pos.Y.Scale, clampedY - scaleOffsetY
+        )
+    end
+end
+
 local function MakeDraggable(frame)
     local dragging = false
     local dragInput, dragStart, startPos
@@ -659,7 +721,10 @@ local function MakeDraggable(frame)
     local conn2 = UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
+            if dragging then
+                dragging = false
+                ClampToViewport(frame)
+            end
         end
     end)
 
@@ -842,6 +907,129 @@ local function UpdateIndicator(dt)
 end
 
 -- ══════════════════════════════════════════════════════
+-- 2v1 — SETA NO SEGUNDO ATACANTE
+-- ══════════════════════════════════════════════════════
+local function CreateThreatArrow()
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "SecondThreatArrow"
+    billboard.Size = UDim2.new(0, 70, 0, 70)
+    billboard.StudsOffset = Vector3.new(0, 4.2, 0)
+    billboard.AlwaysOnTop = true
+    billboard.LightInfluence = 0
+    billboard.MaxDistance = CONFIG.SecondThreatRange + 40
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Arrow"
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = "⚠▼"
+    label.TextColor3 = Color3.fromRGB(255, 170, 40)
+    label.TextStrokeTransparency = 0.2
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.Font = Enum.Font.GothamBlack
+    label.TextScaled = true
+    label.Parent = billboard
+
+    return billboard
+end
+
+local function RemoveSecondThreat()
+    if State.ThreatArrow then
+        pcall(function() State.ThreatArrow:Destroy() end)
+        State.ThreatArrow = nil
+    end
+    State.SecondThreat = nil
+    State.SecondThreatTime = 0
+end
+
+local function AttachThreatArrow(targetChar)
+    if State.ThreatArrow then
+        State.ThreatArrow:Destroy()
+        State.ThreatArrow = nil
+    end
+    if not targetChar then return end
+    local head = targetChar:FindFirstChild("Head")
+    local root = targetChar:FindFirstChild("HumanoidRootPart")
+    local parent = head or root
+    if not parent then return end
+
+    State.ThreatArrow = CreateThreatArrow()
+    State.ThreatArrow.Adornee = parent
+    State.ThreatArrow.Parent = parent
+end
+
+-- Acha o provável segundo atacante: inimigo vivo, != alvo atual, mais perto e na frente
+local function FindSecondAttacker()
+    if not State.Root then return nil end
+    local myPos = State.Root.Position
+    local camLook = Camera.CFrame.LookVector
+    local best, bestScore = nil, math.huge
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player ~= State.Target and Alive(player) then
+            local _, root = GetParts(player)
+            if root then
+                local toTarget = root.Position - myPos
+                local dist = toTarget.Magnitude
+                if dist <= CONFIG.SecondThreatRange then
+                    local dot = toTarget.Magnitude > 0.1 and camLook:Dot(toTarget.Unit) or 0
+                    -- prioriza quem está perto; pequeno bônus pra quem está na frente
+                    local score = dist - dot * 15
+                    if score < bestScore then
+                        bestScore = score
+                        best = player
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Chamado quando o player leva dano estando lockado
+local function FlagSecondThreat()
+    local attacker = FindSecondAttacker()
+    if not attacker then return end
+
+    State.SecondThreatTime = tick()
+    if State.SecondThreat ~= attacker then
+        State.SecondThreat = attacker
+        local char = attacker.Character
+        AttachThreatArrow(char)
+    end
+end
+
+-- Atualiza/expira a seta do segundo atacante
+local function UpdateSecondThreat(dt)
+    if not State.SecondThreat then return end
+
+    -- Some se: não está mais lockado, virou o alvo principal, morreu, ou expirou
+    local stillValid = State.IsLocked
+        and State.SecondThreat ~= State.Target
+        and Alive(State.SecondThreat)
+        and (tick() - State.SecondThreatTime) < CONFIG.SecondThreatTimeout
+
+    if not stillValid then
+        RemoveSecondThreat()
+        return
+    end
+
+    -- Reatacha se o character respawnou / a seta sumiu
+    if not State.ThreatArrow or not State.ThreatArrow.Parent then
+        AttachThreatArrow(State.SecondThreat.Character)
+    end
+
+    -- Pulsa o aviso pra chamar atenção
+    if State.ThreatArrow then
+        local arrow = State.ThreatArrow:FindFirstChild("Arrow")
+        if arrow then
+            local pulse = 0.5 + math.abs(math.sin(tick() * 6)) * 0.5
+            arrow.TextTransparency = 1 - pulse
+        end
+    end
+end
+
+-- ══════════════════════════════════════════════════════
 -- LOCK / UNLOCK / CYCLE
 -- ══════════════════════════════════════════════════════
 Unlock = function()
@@ -856,6 +1044,7 @@ Unlock = function()
 
     DisableAutoFace()
     RemoveIndicator()
+    RemoveSecondThreat()
     RefreshTargetCache()
 
     pcall(function()
@@ -875,6 +1064,11 @@ LockOn = function(target)
 
     -- Se já locked no mesmo target, ignora
     if State.Target == target and State.IsLocked then return end
+
+    -- Troca de alvo limpa o aviso de segundo atacante (contexto mudou)
+    if State.SecondThreat == target or State.Target ~= target then
+        RemoveSecondThreat()
+    end
 
     State.Target = target
     State.IsLocked = true
@@ -968,7 +1162,9 @@ end
 -- AUTO-LOCK ON HIT (detecta dano recebido)
 -- ══════════════════════════════════════════════════════
 local function SetupAutoLockOnHit()
-    if not CONFIG.AutoLockOnHit or not State.Hum then return end
+    -- Sempre conecta: precisamos do evento de dano pro shake e pra detecção 2v1.
+    -- O comportamento de auto-lock é decidido em runtime por CONFIG.AutoLockOnHit.
+    if not State.Hum then return end
 
     local lastHP = State.Hum.Health
 
@@ -979,20 +1175,24 @@ local function SetupAutoLockOnHit()
         end
         lastHP = newHP
 
-        -- Não auto-lock se já locked
+        if not CONFIG.SystemEnabled then return end
+
+        -- Feedback de dano sempre
+        TriggerDamageShake()
+
+        -- Já lockado: mantém o alvo, mas sinaliza o segundo atacante (seta 2v1)
         if State.IsLocked then
-            TriggerDamageShake()
+            FlagSecondThreat()
             return
         end
 
-        if not CONFIG.SystemEnabled then return end
+        -- Sem lock: auto-lock só se o toggle estiver ligado
+        if not CONFIG.AutoLockOnHit then return end
 
-        -- Tenta achar quem está mais perto e na frente
         local best = FindBestTarget()
         if best then
             State.RecentAttackers[best.Name] = tick()
             LockOn(best)
-            TriggerDamageShake()
         end
     end))
 end
@@ -1042,7 +1242,10 @@ local function UpdateCamera(dt)
 
     -- Se não está locked
     if not State.IsLocked or not State.Target or not State.Root then
-        ApplyAimFriction(dt)
+        -- Não mexe na câmera se o personagem estiver morto (evita travar no chão)
+        if State.Hum and State.Hum.Health > 0 then
+            ApplyAimFriction(dt)
+        end
         return
     end
 
@@ -1071,6 +1274,9 @@ local function UpdateCamera(dt)
 
     -- Indicator
     UpdateIndicator(dt)
+
+    -- Seta do segundo atacante (2v1)
+    UpdateSecondThreat(dt)
 
     -- Orbital
     UpdateOrbitalOffset(dt)
@@ -1134,6 +1340,20 @@ local function UpdateCamera(dt)
     -- Aplica shake
     camGoal = camGoal + State.CameraShakeOffset
 
+    -- Guarda de sanidade: vetores inválidos travariam a câmera
+    if not IsFiniteVec(camGoal) or not IsFiniteVec(focusPoint) then
+        Unlock()
+        return
+    end
+
+    -- Limita o passo por frame pra evitar teleporte/overshoot quando o alvo dá dash
+    local camPos = Camera.CFrame.Position
+    local step = camGoal - camPos
+    local maxStep = CONFIG.CameraMaxStep
+    if step.Magnitude > maxStep then
+        camGoal = camPos + step.Unit * maxStep
+    end
+
     local goalCF = CFrame.lookAt(camGoal, focusPoint)
     local smoothAlpha = ExpDecay(CONFIG.CamSmoothRate, dt) * fadeAlpha
     Camera.CFrame = SafeLerp(Camera.CFrame, goalCF, smoothAlpha)
@@ -1160,8 +1380,10 @@ local function BuildUI()
     -- ═══════════ MENU HUB ═══════════
     local hubFrame = Instance.new("Frame")
     hubFrame.Name = "HubFrame"
-    hubFrame.Size = UDim2.new(0, 220, 0, 290) -- maior pra caber tudo
-    hubFrame.Position = UDim2.new(0.02, 0, 0.3, 0)
+    hubFrame.Size = UDim2.new(0, 220, 0, 390) -- maior pra caber todos os botões
+    hubFrame.Position = State.SavedHubPos or CONFIG.DefaultHubPos
+    State.MenuOpen = CONFIG.MenuOpenDefault
+    hubFrame.Visible = State.MenuOpen
     hubFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
     hubFrame.BackgroundTransparency = 0.05
     hubFrame.BorderSizePixel = 0
@@ -1186,7 +1408,7 @@ local function BuildUI()
     local hubTitle = Instance.new("TextLabel")
     hubTitle.Size = UDim2.new(1, 0, 0, 35)
     hubTitle.BackgroundTransparency = 1
-    hubTitle.Text = "⚡ LOCK-ON HUB v6.1"
+    hubTitle.Text = "⚡ LOCK-ON HUB v6.2"
     hubTitle.TextColor3 = Color3.fromRGB(255, 80, 80)
     hubTitle.Font = Enum.Font.GothamBold
     hubTitle.TextSize = 14
@@ -1250,11 +1472,21 @@ local function BuildUI()
         5
     )
 
+    -- Botão 6: Auto-Lock ao Apanhar (toggle)
+    local btnAutoLock = MakeHubButton(
+        CONFIG.AutoLockOnHit and "🎯 Auto-Lock ao Apanhar: ON" or "🎯 Auto-Lock ao Apanhar: OFF",
+        CONFIG.AutoLockOnHit and Color3.fromRGB(40, 110, 90) or Color3.fromRGB(70, 70, 80),
+        nil, 6
+    )
+
+    -- Botão 7: Resetar posições dos botões
+    local btnReset = MakeHubButton("↺ Resetar Posições", Color3.fromRGB(60, 45, 25), Color3.fromRGB(255, 210, 150), 7)
+
     -- ═══════════ BLACK FLASH FLOATING BUTTON ═══════════
     MiniBlackFlashBtn = Instance.new("TextButton")
     MiniBlackFlashBtn.Name = "BF_Button"
     MiniBlackFlashBtn.Size = UDim2.new(0, 65, 0, 65)
-    MiniBlackFlashBtn.Position = UDim2.new(0.5, -32, 0.7, 0)
+    MiniBlackFlashBtn.Position = State.SavedBFPos or CONFIG.DefaultBFPos
     MiniBlackFlashBtn.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
     MiniBlackFlashBtn.Text = "B.FLASH\n0.28s"
     MiniBlackFlashBtn.TextColor3 = Color3.fromRGB(255, 0, 0)
@@ -1272,6 +1504,74 @@ local function BuildUI()
     bfOuterStroke.Parent = MiniBlackFlashBtn
 
     MakeDraggable(MiniBlackFlashBtn)
+
+    -- ═══════════ MENU TOGGLE (abre/fecha o hub) ═══════════
+    local menuToggle = Instance.new("TextButton")
+    menuToggle.Name = "MenuToggle"
+    menuToggle.Size = UDim2.new(0, CONFIG.MenuToggleSize, 0, CONFIG.MenuToggleSize)
+    menuToggle.Position = State.SavedMenuTogglePos or CONFIG.DefaultMenuTogglePos
+    menuToggle.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+    menuToggle.Text = "☰"
+    menuToggle.TextColor3 = Color3.fromRGB(255, 90, 90)
+    menuToggle.TextScaled = true
+    menuToggle.Font = Enum.Font.GothamBold
+    menuToggle.Active = true
+    menuToggle.Parent = screen
+    Instance.new("UICorner", menuToggle).CornerRadius = UDim.new(0, 10)
+    local mtStroke = Instance.new("UIStroke")
+    mtStroke.Color = Color3.fromRGB(255, 60, 60)
+    mtStroke.Thickness = 1.5
+    mtStroke.Transparency = 0.3
+    mtStroke.Parent = menuToggle
+
+    -- Drag com threshold pra diferenciar tap (toggle) de arrasto (mover)
+    do
+        local dragging, dragStart, startPos, moved = false, nil, nil, false
+        menuToggle.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch
+                or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true
+                dragStart = input.Position
+                startPos = menuToggle.Position
+                moved = false
+            end
+        end)
+        local mtConn1 = UserInputService.InputChanged:Connect(function(input)
+            if not dragging then return end
+            if input.UserInputType ~= Enum.UserInputType.Touch
+                and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+            local delta = input.Position - dragStart
+            if delta.Magnitude > CONFIG.DragThreshold then
+                moved = true
+                menuToggle.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + delta.X,
+                    startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                )
+            end
+        end)
+        local mtConn2 = UserInputService.InputEnded:Connect(function(input)
+            if (input.UserInputType == Enum.UserInputType.Touch
+                or input.UserInputType == Enum.UserInputType.MouseButton1) and dragging then
+                dragging = false
+                if moved then
+                    ClampToViewport(menuToggle)
+                    State.SavedMenuTogglePos = menuToggle.Position
+                else
+                    -- tap: alterna o menu
+                    State.MenuOpen = not State.MenuOpen
+                    hubFrame.Visible = State.MenuOpen
+                    menuToggle.BackgroundColor3 = State.MenuOpen
+                        and Color3.fromRGB(200, 50, 50)
+                        or Color3.fromRGB(20, 20, 28)
+                    if State.MenuOpen then ClampToViewport(hubFrame) end
+                end
+            end
+        end)
+        menuToggle.Destroying:Connect(function()
+            mtConn1:Disconnect()
+            mtConn2:Disconnect()
+        end)
+    end
 
     -- ═══════════ LOCK-ON BUTTON (original) ═══════════
     local btnFrame = Instance.new("Frame")
@@ -1334,6 +1634,7 @@ local function BuildUI()
             if dragging then
                 dragging = false
                 if State.ButtonDragging then
+                    ClampToViewport(btnFrame)
                     State.SavedButtonPos = btnFrame.Position
                 end
                 task.delay(0.05, function() State.ButtonDragging = false end)
@@ -1428,6 +1729,32 @@ local function BuildUI()
         end
     end)
 
+    -- Botão 6: Auto-Lock ao Apanhar (toggle)
+    btnAutoLock.MouseButton1Click:Connect(function()
+        CONFIG.AutoLockOnHit = not CONFIG.AutoLockOnHit
+        btnAutoLock.Text = CONFIG.AutoLockOnHit
+            and "🎯 Auto-Lock ao Apanhar: ON"
+            or "🎯 Auto-Lock ao Apanhar: OFF"
+        btnAutoLock.BackgroundColor3 = CONFIG.AutoLockOnHit
+            and Color3.fromRGB(40, 110, 90)
+            or Color3.fromRGB(70, 70, 80)
+    end)
+
+    -- Botão 7: Resetar posições de todos os botões
+    btnReset.MouseButton1Click:Connect(function()
+        State.SavedButtonPos = nil
+        State.SavedBFPos = nil
+        State.SavedMenuTogglePos = nil
+        State.SavedHubPos = nil
+        btnFrame.Position = CONFIG.DefaultButtonPos
+        MiniBlackFlashBtn.Position = CONFIG.DefaultBFPos
+        menuToggle.Position = CONFIG.DefaultMenuTogglePos
+        hubFrame.Position = CONFIG.DefaultHubPos
+        btnReset.Text = "✓ Posições Resetadas!"
+        task.wait(1.2)
+        btnReset.Text = "↺ Resetar Posições"
+    end)
+
     -- Black Flash action
     local bfCooldown = false
     MiniBlackFlashBtn.MouseButton1Click:Connect(function()
@@ -1478,15 +1805,40 @@ local function BuildUI()
         HubFrame = hubFrame,
         BtnToggle = btnToggle,
         BtnMode = btnMode,
+        BFButton = MiniBlackFlashBtn,
+        MenuToggle = menuToggle,
     }
+end
+
+-- Reposiciona todos os elementos visíveis pra dentro da tela
+local function ReclampAllUI()
+    if UI.HubFrame and UI.HubFrame.Visible then ClampToViewport(UI.HubFrame) end
+    if UI.BtnFrame then ClampToViewport(UI.BtnFrame) end
+    if UI.BFButton and UI.BFButton.Visible then ClampToViewport(UI.BFButton) end
+    if UI.MenuToggle then ClampToViewport(UI.MenuToggle) end
 end
 
 -- ══════════════════════════════════════════════════════
 -- CHARACTER SETUP
 -- ══════════════════════════════════════════════════════
+-- Devolve o controle da câmera ao Roblox (usado ao morrer / respawnar)
+local function ReleaseCamera(subject)
+    pcall(function()
+        Camera = workspace.CurrentCamera or Camera
+        Camera.CameraType = Enum.CameraType.Custom
+        if subject then
+            Camera.CameraSubject = subject
+        end
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        State.CurrentFOV = State.DefaultFOV
+        Camera.FieldOfView = State.DefaultFOV
+    end)
+end
+
 local function OnCharacter(char)
     DisableAutoFace()
     RemoveIndicator()
+    RemoveSecondThreat()
 
     State.Char = char
     State.Hum = char:WaitForChild("Humanoid", 10)
@@ -1496,13 +1848,19 @@ local function OnCharacter(char)
 
     if State.IsLocked then Unlock() end
 
+    -- Garante que o respawn volte a seguir o personagem novo (corrige câmera travada)
+    ReleaseCamera(State.Hum)
+
     -- Reconecta auto-lock on hit
     SetupAutoLockOnHit()
 
     Conn("SelfDied", State.Hum.Died:Connect(function()
         DisableAutoFace()
         RemoveIndicator()
+        RemoveSecondThreat()
         Unlock()
+        -- Solta a câmera no local da morte pra não ficar travada no chão
+        ReleaseCamera(State.Hum)
     end))
 end
 
@@ -1559,22 +1917,30 @@ local function Init()
     end
     LocalPlayer.CharacterAdded:Connect(OnCharacter)
 
+    -- Referência dinâmica da câmera (alguns jogos recriam a CurrentCamera no respawn)
+    local function BindViewportListener()
+        Conn("ViewportSize", Camera:GetPropertyChangedSignal("ViewportSize"):Connect(ReclampAllUI))
+    end
+    BindViewportListener()
+    Conn("CurrentCamera", workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        if workspace.CurrentCamera then
+            Camera = workspace.CurrentCamera
+            State.DefaultFOV = Camera.FieldOfView
+            BindViewportListener()
+        end
+    end))
+
     -- Main render loop
     RunService.RenderStepped:Connect(UpdateCamera)
 
     print("══════════════════════════════════════════════════")
-    print("  LOCK-ON SYSTEM v6.1 — FULL FIX & POLISH")
-    print("  ✦ SphereCast implementado (com fallback)")
-    print("  ✦ FOV dinâmico funcional")
-    print("  ✦ Aim Friction funcional")
-    print("  ✦ Wall-check com timeout e indicador visual")
-    print("  ✦ Auto-lock on hit + Auto-switch on kill")
-    print("  ✦ Camera shake de dano")
-    print("  ✦ Orbital camera offset")
-    print("  ✦ Target indicator (billboard)")
-    print("  ✦ Cycle cooldown + buffer")
-    print("  ✦ Unlock fade suave por distância")
-    print("  ✦ Mobile swipe support")
+    print("  LOCK-ON SYSTEM v6.2 — COMBAT FIXES")
+    print("  ✦ Menu com botão de abrir/fechar (☰)")
+    print("  ✦ Botões e menu não saem mais da tela (clamp + reset)")
+    print("  ✦ Câmera no lock estável (anti-teleporte/overshoot)")
+    print("  ✦ Fix: câmera não trava mais no chão ao morrer")
+    print("  ✦ Auto-lock ao apanhar agora é toggle no menu")
+    print("  ✦ 2v1: seta aponta o segundo atacante")
     print("══════════════════════════════════════════════════")
 end
 
