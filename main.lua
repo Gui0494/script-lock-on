@@ -122,6 +122,8 @@ local CONFIG = {
     SoftLockKey          = Enum.KeyCode.T,
     NextTargetKey        = Enum.KeyCode.E,
     PrevTargetKey        = Enum.KeyCode.R,
+    DashLeftKey          = Enum.KeyCode.Z,
+    DashRightKey         = Enum.KeyCode.C,
 
     -- ▸ Mobile
     ButtonSize           = 62,
@@ -141,6 +143,17 @@ local CONFIG = {
     -- ▸ 2v1 (seta no segundo atacante)
     SecondThreatTimeout  = 3.0,  -- segundos sem novo dano antes de sumir a seta
     SecondThreatRange    = 120,  -- distância máxima pra considerar segundo atacante
+
+    -- ▸ Side Dash
+    DashSpeed            = 90,    -- studs/s durante o dash
+    DashDuration         = 0.18,  -- duração do impulso
+    DashCooldown         = 0.35,  -- cooldown antes do próximo dash
+    DashTangentWeight    = 1.0,   -- peso do strafe (perpendicular ao alvo)
+    DashBackWeight       = 0.6,   -- viés pras costas do inimigo (quando lockado)
+    DashButtonSize       = 58,
+    DefaultDashLeftPos   = UDim2.new(1, -150, 0.78, 0),
+    DefaultDashRightPos  = UDim2.new(1, -85, 0.78, 0),
+    ShowDashButtonsDefault = true,
 }
 
 -- ══════════════════════════════════════════════════════
@@ -201,6 +214,11 @@ local State = {
     SecondThreat         = nil,
     SecondThreatTime     = 0,
     ThreatArrow          = nil,
+
+    -- Side dash
+    Dashing              = false,
+    SavedDashLeftPos     = nil,
+    SavedDashRightPos    = nil,
 }
 
 -- ══════════════════════════════════════════════════════
@@ -1186,6 +1204,64 @@ CycleTarget = function(direction)
 end
 
 -- ══════════════════════════════════════════════════════
+-- SIDE DASH (lateral; lockado = contorna pras costas do alvo)
+-- ══════════════════════════════════════════════════════
+local function SideDash(side) -- side: -1 esquerda, +1 direita
+    if State.Dashing or not CONFIG.SystemEnabled then return end
+    local root = State.Root
+    if not root then return end
+
+    local up = Vector3.yAxis
+    local dir
+
+    if State.IsLocked and State.CachedTargetRoot then
+        -- Strafe perpendicular ao alvo, com viés pras costas do inimigo
+        local toEnemy = State.CachedTargetRoot.Position - root.Position
+        toEnemy = Vector3.new(toEnemy.X, 0, toEnemy.Z)
+        if toEnemy.Magnitude < 0.1 then return end
+        toEnemy = toEnemy.Unit
+
+        local tangent = toEnemy:Cross(up)
+        if tangent.Magnitude < 0.1 then return end
+        tangent = tangent.Unit * side
+
+        local backBias = Vector3.zero
+        local enemyFwd = State.CachedTargetRoot.CFrame.LookVector
+        enemyFwd = Vector3.new(enemyFwd.X, 0, enemyFwd.Z)
+        if enemyFwd.Magnitude > 0.1 then
+            -- as costas do inimigo ficam no sentido oposto ao que ele olha
+            backBias = -enemyFwd.Unit * CONFIG.DashBackWeight
+        end
+
+        dir = tangent * CONFIG.DashTangentWeight + backBias
+        if dir.Magnitude < 0.1 then dir = tangent end
+        dir = dir.Unit
+    else
+        -- Sem lock: dash lateral simples relativo ao personagem
+        local rv = root.CFrame.RightVector
+        rv = Vector3.new(rv.X, 0, rv.Z)
+        if rv.Magnitude < 0.1 then return end
+        dir = rv.Unit * side
+    end
+
+    State.Dashing = true
+    local startTime = tick()
+    Conn("Dash", RunService.Heartbeat:Connect(function()
+        local r = State.Root
+        if not r or (tick() - startTime) >= CONFIG.DashDuration then
+            if State.Conns.Dash then
+                pcall(function() State.Conns.Dash:Disconnect() end)
+                State.Conns.Dash = nil
+            end
+            task.delay(CONFIG.DashCooldown, function() State.Dashing = false end)
+            return
+        end
+        local curY = r.AssemblyLinearVelocity.Y
+        r.AssemblyLinearVelocity = dir * CONFIG.DashSpeed + Vector3.new(0, curY, 0)
+    end))
+end
+
+-- ══════════════════════════════════════════════════════
 -- AUTO-LOCK ON HIT (detecta dano recebido)
 -- ══════════════════════════════════════════════════════
 local function SetupAutoLockOnHit()
@@ -1408,7 +1484,7 @@ local function BuildUI()
     -- ═══════════ MENU HUB ═══════════
     local hubFrame = Instance.new("Frame")
     hubFrame.Name = "HubFrame"
-    hubFrame.Size = UDim2.new(0, 220, 0, 390) -- maior pra caber todos os botões
+    hubFrame.Size = UDim2.new(0, 220, 0, 440) -- maior pra caber todos os botões
     hubFrame.Position = State.SavedHubPos or CONFIG.DefaultHubPos
     State.MenuOpen = CONFIG.MenuOpenDefault
     hubFrame.Visible = State.MenuOpen
@@ -1507,8 +1583,15 @@ local function BuildUI()
         nil, 6
     )
 
-    -- Botão 7: Resetar posições dos botões
-    local btnReset = MakeHubButton("↺ Resetar Posições", Color3.fromRGB(60, 45, 25), Color3.fromRGB(255, 210, 150), 7)
+    -- Botão 7: Side Dash (toggle visibilidade dos botões de dash)
+    local btnDash = MakeHubButton(
+        CONFIG.ShowDashButtonsDefault and "💨 Side Dash: ON" or "💨 Side Dash: OFF",
+        CONFIG.ShowDashButtonsDefault and Color3.fromRGB(25, 60, 90) or Color3.fromRGB(70, 70, 80),
+        Color3.fromRGB(140, 200, 255), 7
+    )
+
+    -- Botão 8: Resetar posições dos botões
+    local btnReset = MakeHubButton("↺ Resetar Posições", Color3.fromRGB(60, 45, 25), Color3.fromRGB(255, 210, 150), 8)
 
     -- ═══════════ BLACK FLASH FLOATING BUTTON ═══════════
     MiniBlackFlashBtn = Instance.new("TextButton")
@@ -1552,54 +1635,92 @@ local function BuildUI()
     mtStroke.Transparency = 0.3
     mtStroke.Parent = menuToggle
 
-    -- Drag com threshold pra diferenciar tap (toggle) de arrasto (mover)
-    do
+    -- Helper: botão flutuante com tap (ação) vs arrasto (mover) + clamp
+    local function WireTapDrag(btn, onTap, onMoved)
         local dragging, dragStart, startPos, moved = false, nil, nil, false
-        menuToggle.InputBegan:Connect(function(input)
+        btn.InputBegan:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.Touch
                 or input.UserInputType == Enum.UserInputType.MouseButton1 then
                 dragging = true
                 dragStart = input.Position
-                startPos = menuToggle.Position
+                startPos = btn.Position
                 moved = false
             end
         end)
-        local mtConn1 = UserInputService.InputChanged:Connect(function(input)
+        local c1 = UserInputService.InputChanged:Connect(function(input)
             if not dragging then return end
             if input.UserInputType ~= Enum.UserInputType.Touch
                 and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
             local delta = input.Position - dragStart
             if delta.Magnitude > CONFIG.DragThreshold then
                 moved = true
-                menuToggle.Position = UDim2.new(
+                btn.Position = UDim2.new(
                     startPos.X.Scale, startPos.X.Offset + delta.X,
                     startPos.Y.Scale, startPos.Y.Offset + delta.Y
                 )
             end
         end)
-        local mtConn2 = UserInputService.InputEnded:Connect(function(input)
+        local c2 = UserInputService.InputEnded:Connect(function(input)
             if (input.UserInputType == Enum.UserInputType.Touch
                 or input.UserInputType == Enum.UserInputType.MouseButton1) and dragging then
                 dragging = false
                 if moved then
-                    ClampToViewport(menuToggle)
-                    State.SavedMenuTogglePos = menuToggle.Position
-                else
-                    -- tap: alterna o menu
-                    State.MenuOpen = not State.MenuOpen
-                    hubFrame.Visible = State.MenuOpen
-                    menuToggle.BackgroundColor3 = State.MenuOpen
-                        and Color3.fromRGB(200, 50, 50)
-                        or Color3.fromRGB(20, 20, 28)
-                    if State.MenuOpen then ClampToViewport(hubFrame) end
+                    ClampToViewport(btn)
+                    if onMoved then onMoved(btn) end
+                elseif onTap then
+                    onTap()
                 end
             end
         end)
-        menuToggle.Destroying:Connect(function()
-            mtConn1:Disconnect()
-            mtConn2:Disconnect()
+        btn.Destroying:Connect(function()
+            c1:Disconnect()
+            c2:Disconnect()
         end)
     end
+
+    WireTapDrag(menuToggle, function()
+        State.MenuOpen = not State.MenuOpen
+        hubFrame.Visible = State.MenuOpen
+        menuToggle.BackgroundColor3 = State.MenuOpen
+            and Color3.fromRGB(200, 50, 50)
+            or Color3.fromRGB(20, 20, 28)
+        if State.MenuOpen then ClampToViewport(hubFrame) end
+    end, function(b)
+        State.SavedMenuTogglePos = b.Position
+    end)
+
+    -- ═══════════ SIDE DASH BUTTONS (flutuantes) ═══════════
+    local function MakeDashButton(text, pos)
+        local b = Instance.new("TextButton")
+        b.Name = "DashButton"
+        b.Size = UDim2.new(0, CONFIG.DashButtonSize, 0, CONFIG.DashButtonSize)
+        b.Position = pos
+        b.BackgroundColor3 = Color3.fromRGB(25, 35, 55)
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(140, 200, 255)
+        b.TextScaled = true
+        b.Font = Enum.Font.GothamBlack
+        b.Visible = CONFIG.ShowDashButtonsDefault
+        b.Active = true
+        b.Parent = screen
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 12)
+        local s = Instance.new("UIStroke")
+        s.Color = Color3.fromRGB(80, 160, 255)
+        s.Thickness = 1.5
+        s.Transparency = 0.2
+        s.Parent = b
+        return b
+    end
+
+    local dashLeftBtn = MakeDashButton("⟵", State.SavedDashLeftPos or CONFIG.DefaultDashLeftPos)
+    local dashRightBtn = MakeDashButton("⟶", State.SavedDashRightPos or CONFIG.DefaultDashRightPos)
+
+    WireTapDrag(dashLeftBtn, function() SideDash(-1) end, function(b)
+        State.SavedDashLeftPos = b.Position
+    end)
+    WireTapDrag(dashRightBtn, function() SideDash(1) end, function(b)
+        State.SavedDashRightPos = b.Position
+    end)
 
     -- ═══════════ LOCK-ON BUTTON (original) ═══════════
     local btnFrame = Instance.new("Frame")
@@ -1768,16 +1889,31 @@ local function BuildUI()
             or Color3.fromRGB(70, 70, 80)
     end)
 
-    -- Botão 7: Resetar posições de todos os botões
+    -- Botão 7: Side Dash (mostra/esconde os botões de dash)
+    btnDash.MouseButton1Click:Connect(function()
+        local vis = not dashLeftBtn.Visible
+        dashLeftBtn.Visible = vis
+        dashRightBtn.Visible = vis
+        btnDash.Text = vis and "💨 Side Dash: ON" or "💨 Side Dash: OFF"
+        btnDash.BackgroundColor3 = vis
+            and Color3.fromRGB(25, 60, 90)
+            or Color3.fromRGB(70, 70, 80)
+    end)
+
+    -- Botão 8: Resetar posições de todos os botões
     btnReset.MouseButton1Click:Connect(function()
         State.SavedButtonPos = nil
         State.SavedBFPos = nil
         State.SavedMenuTogglePos = nil
         State.SavedHubPos = nil
+        State.SavedDashLeftPos = nil
+        State.SavedDashRightPos = nil
         btnFrame.Position = CONFIG.DefaultButtonPos
         MiniBlackFlashBtn.Position = CONFIG.DefaultBFPos
         menuToggle.Position = CONFIG.DefaultMenuTogglePos
         hubFrame.Position = CONFIG.DefaultHubPos
+        dashLeftBtn.Position = CONFIG.DefaultDashLeftPos
+        dashRightBtn.Position = CONFIG.DefaultDashRightPos
         btnReset.Text = "✓ Posições Resetadas!"
         task.wait(1.2)
         btnReset.Text = "↺ Resetar Posições"
@@ -1835,6 +1971,8 @@ local function BuildUI()
         BtnMode = btnMode,
         BFButton = MiniBlackFlashBtn,
         MenuToggle = menuToggle,
+        DashLeft = dashLeftBtn,
+        DashRight = dashRightBtn,
     }
 end
 
@@ -1844,6 +1982,8 @@ local function ReclampAllUI()
     if UI.BtnFrame then ClampToViewport(UI.BtnFrame) end
     if UI.BFButton and UI.BFButton.Visible then ClampToViewport(UI.BFButton) end
     if UI.MenuToggle then ClampToViewport(UI.MenuToggle) end
+    if UI.DashLeft and UI.DashLeft.Visible then ClampToViewport(UI.DashLeft) end
+    if UI.DashRight and UI.DashRight.Visible then ClampToViewport(UI.DashRight) end
 end
 
 -- ══════════════════════════════════════════════════════
@@ -1929,6 +2069,12 @@ UserInputService.InputBegan:Connect(function(input, processed)
 
     elseif key == CONFIG.PrevTargetKey then
         CycleTarget(-1)
+
+    elseif key == CONFIG.DashLeftKey then
+        SideDash(-1)
+
+    elseif key == CONFIG.DashRightKey then
+        SideDash(1)
     end
 end)
 
@@ -1969,6 +2115,8 @@ local function Init()
     print("  ✦ Fix: câmera não trava mais no chão ao morrer")
     print("  ✦ Auto-lock ao apanhar agora é toggle no menu")
     print("  ✦ 2v1: seta aponta o segundo atacante")
+    print("  ✦ Auto-lock foca em quem te atacou (não na frente)")
+    print("  ✦ Side Dash (Z/C ou botões) — contorna pras costas do alvo")
     print("══════════════════════════════════════════════════")
 end
 
