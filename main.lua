@@ -65,6 +65,10 @@ local CONFIG = {
     LowHPWeight          = 0.15,
     ApproachWeight       = 0.25,
 
+    -- ▸ Detecção de atacante (independente da câmera)
+    AttackerFacingWeight   = 30,  -- bônus se o inimigo está virado pra você
+    AttackerApproachWeight = 18,  -- bônus se o inimigo vem na sua direção
+
     -- ▸ Wall validation
     WallLossTimeout      = 2.5,
     WallCheckInterval    = 0.15,
@@ -959,31 +963,54 @@ local function AttachThreatArrow(targetChar)
 end
 
 -- Acha o provável segundo atacante: inimigo vivo, != alvo atual, mais perto e na frente
-local function FindSecondAttacker()
+-- Estima quem te atacou SEM usar a direção da câmera (o cliente não informa o agressor).
+-- Heurística: inimigo mais próximo, virado pra você e/ou vindo na sua direção.
+local function FindLikelyAttacker(excludeTarget, maxRange)
     if not State.Root then return nil end
     local myPos = State.Root.Position
-    local camLook = Camera.CFrame.LookVector
+    local eyePos = myPos + Vector3.new(0, 1.5, 0)
     local best, bestScore = nil, math.huge
 
     for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player ~= State.Target and Alive(player) then
+        if player ~= LocalPlayer and player ~= excludeTarget and Alive(player) then
             local _, root = GetParts(player)
             if root then
-                local toTarget = root.Position - myPos
-                local dist = toTarget.Magnitude
-                if dist <= CONFIG.SecondThreatRange then
-                    local dot = toTarget.Magnitude > 0.1 and camLook:Dot(toTarget.Unit) or 0
-                    -- prioriza quem está perto; pequeno bônus pra quem está na frente
-                    local score = dist - dot * 15
-                    if score < bestScore then
-                        bestScore = score
-                        best = player
+                local toMe = myPos - root.Position
+                local dist = toMe.Magnitude
+                if dist <= maxRange and dist > 0.01 then
+                    local dirToMe = toMe.Unit
+
+                    -- filtro leve: ignora quem está atrás de parede (evita lock errado)
+                    if ClearSight(eyePos, root.Position + Vector3.new(0, 1.5, 0)) then
+                        local score = dist
+
+                        -- inimigo virado pra você = provável agressor
+                        local facing = root.CFrame.LookVector:Dot(dirToMe)
+                        score = score - facing * CONFIG.AttackerFacingWeight
+
+                        -- inimigo se aproximando de você
+                        local vel = root.Velocity
+                        if vel.Magnitude > 1 then
+                            local approach = vel.Unit:Dot(dirToMe)
+                            if approach > 0 then
+                                score = score - approach * CONFIG.AttackerApproachWeight
+                            end
+                        end
+
+                        if score < bestScore then
+                            bestScore = score
+                            best = player
+                        end
                     end
                 end
             end
         end
     end
     return best
+end
+
+local function FindSecondAttacker()
+    return FindLikelyAttacker(State.Target, CONFIG.SecondThreatRange)
 end
 
 -- Chamado quando o player leva dano estando lockado
@@ -1189,7 +1216,8 @@ local function SetupAutoLockOnHit()
         -- Sem lock: auto-lock só se o toggle estiver ligado
         if not CONFIG.AutoLockOnHit then return end
 
-        local best = FindBestTarget()
+        -- Foca em quem te atacou (heurística), não em quem está na frente da câmera
+        local best = FindLikelyAttacker(nil, CONFIG.MaxLockDistance) or FindBestTarget()
         if best then
             State.RecentAttackers[best.Name] = tick()
             LockOn(best)
