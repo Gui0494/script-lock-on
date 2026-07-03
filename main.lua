@@ -88,7 +88,8 @@ local CONFIG = {
     -- ▸ AAA Camera
     CameraShoulderOffset = Vector3.new(1.5, 0, 0),
     SoftLockEnabled      = true,
-    CameraMaxStep        = 14,   -- studs máximos que a câmera anda por frame (anti-teleporte)
+    CameraMaxSpeed       = 240,  -- studs/s máximos da câmera (anti-teleporte, por segundo e não por frame)
+    CamWallRecoverRate   = 4,    -- velocidade de retorno da câmera após desviar de parede
     DamageShakeEnabled   = true,
     DamageShakeMagnitude = 0.3,
     DamageShakeDuration  = 0.15,
@@ -146,10 +147,11 @@ local CONFIG = {
 
     -- ▸ Side Dash
     DashSpeed            = 90,    -- studs/s durante o dash
-    DashDuration         = 0.18,  -- duração do impulso
+    DashDuration         = 0.18,  -- duração do dash lateral (sem lock)
     DashCooldown         = 0.35,  -- cooldown antes do próximo dash
-    DashTangentWeight    = 1.0,   -- peso do strafe (perpendicular ao alvo)
-    DashBackWeight       = 0.6,   -- viés pras costas do inimigo (quando lockado)
+    DashMaxDuration      = 0.45,  -- teto do dash guiado (lockado)
+    DashBehindDistance   = 5,     -- studs atrás do inimigo (ponto de chegada)
+    DashStopRadius       = 3,     -- raio de chegada pra encerrar o dash guiado
     DashButtonSize       = 58,
     DefaultDashLeftPos   = UDim2.new(1, -150, 0.78, 0),
     DefaultDashRightPos  = UDim2.new(1, -85, 0.78, 0),
@@ -184,6 +186,7 @@ local State = {
     WallLossTimer        = 0,
     HasLineOfSight       = true,
     LastWallCheck        = 0,
+    SmoothCamDist        = nil,  -- distância suavizada da câmera (desvio de parede)
 
     OrbitalOffset        = 0,
     ButtonDragging       = false,
@@ -669,43 +672,62 @@ local function UpdateCharacterFacing(dt)
     local newDir = SafeLerp(currentLook.Unit, flatDir, ExpDecay(faceRate, dt))
     if typeof(newDir) == "Vector3" and newDir.Magnitude > 0.1 then
         State.SmoothedFaceDir = Vector3.new(newDir.X, 0, newDir.Z).Unit
-        State.Root.CFrame = CFrame.lookAt(
-            State.Root.Position,
-            State.Root.Position + State.SmoothedFaceDir
-        )
+
+        -- Só reescreve o CFrame se a direção mudou de verdade: escrever todo
+        -- frame sem necessidade faz o personagem (e a câmera) micro-tremer
+        local curLook = State.Root.CFrame.LookVector
+        local curFlat = Vector3.new(curLook.X, 0, curLook.Z)
+        if curFlat.Magnitude < 0.1
+            or curFlat.Unit:Dot(State.SmoothedFaceDir) < 0.99995 then
+            State.Root.CFrame = CFrame.lookAt(
+                State.Root.Position,
+                State.Root.Position + State.SmoothedFaceDir
+            )
+        end
     end
 end
 
 -- ══════════════════════════════════════════════════════
 -- UI UTILITIES
 -- ══════════════════════════════════════════════════════
--- Mantém um GuiObject dentro do viewport (≥ ViewportMargin px visíveis)
+-- Mantém um GuiObject dentro da área do pai (ScreenGui).
+-- Usa o espaço do PAI (não Camera.ViewportSize): coordenadas de GUI descontam o
+-- GuiInset do topo, então viewport cru clampava errado no eixo Y.
 local function ClampToViewport(frame)
     if not frame or not frame.Parent then return end
-    local vp = Camera.ViewportSize
-    if vp.X <= 0 or vp.Y <= 0 then return end
+    local parent = frame.Parent
+    local ok, area, parentAbsPos = pcall(function()
+        return parent.AbsoluteSize, parent.AbsolutePosition
+    end)
+    if not ok or not area or area.X <= 0 or area.Y <= 0 then return end
 
     local absSize = frame.AbsoluteSize
-    local absPos = frame.AbsolutePosition
+    -- posição relativa ao pai (espaço em que Position/offset operam)
+    local relX = frame.AbsolutePosition.X - parentAbsPos.X
+    local relY = frame.AbsolutePosition.Y - parentAbsPos.Y
     local margin = CONFIG.ViewportMargin
 
-    -- limites: pelo menos `margin` px do frame sempre visíveis nas duas direções
-    local minX = -absSize.X + margin
-    local maxX = vp.X - margin
-    local minY = -absSize.Y + margin
-    local maxY = vp.Y - margin
+    -- Contenção total quando o elemento cabe na área; senão, garante ≥ margin visível
+    local minX, maxX, minY, maxY
+    if absSize.X <= area.X then
+        minX, maxX = 0, area.X - absSize.X
+    else
+        minX, maxX = area.X - absSize.X, 0 -- maior que a tela: encosta nas bordas
+    end
+    if absSize.Y <= area.Y then
+        minY, maxY = 0, area.Y - absSize.Y
+    else
+        minY, maxY = -(absSize.Y - margin), area.Y - margin
+    end
 
-    local clampedX = math.clamp(absPos.X, minX, maxX)
-    local clampedY = math.clamp(absPos.Y, minY, maxY)
+    local clampedX = math.clamp(relX, minX, maxX)
+    local clampedY = math.clamp(relY, minY, maxY)
 
-    if clampedX ~= absPos.X or clampedY ~= absPos.Y then
-        -- converte de volta pra offset absoluto, descontando a escala atual
+    if clampedX ~= relX or clampedY ~= relY then
         local pos = frame.Position
-        local scaleOffsetX = pos.X.Scale * vp.X
-        local scaleOffsetY = pos.Y.Scale * vp.Y
         frame.Position = UDim2.new(
-            pos.X.Scale, clampedX - scaleOffsetX,
-            pos.Y.Scale, clampedY - scaleOffsetY
+            pos.X.Scale, math.floor(clampedX - pos.X.Scale * area.X + 0.5),
+            pos.Y.Scale, math.floor(clampedY - pos.Y.Scale * area.Y + 0.5)
         )
     end
 end
@@ -737,6 +759,7 @@ local function MakeDraggable(frame)
                 startPos.X.Scale, startPos.X.Offset + delta.X,
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
+            ClampToViewport(frame) -- nunca deixa sair, nem durante o arrasto
         end
     end)
 
@@ -1086,6 +1109,7 @@ Unlock = function()
     State.SmoothedPrediction = Vector3.zero
     State.LastTargetPos = nil
     State.OrbitalOffset = 0
+    State.SmoothCamDist = nil
 
     DisableAutoFace()
     RemoveIndicator()
@@ -1120,6 +1144,14 @@ LockOn = function(target)
     State.WallLossTimer = 0
     State.HasLineOfSight = true
     State.OrbitalOffset = 0
+
+    -- Reset da predição: sem isso, trocar de alvo gera uma "velocidade" gigante
+    -- (posição do alvo antigo → novo) e a câmera chicoteia/voa
+    State.TargetVelocity = Vector3.zero
+    State.SmoothedPrediction = Vector3.zero
+    State.LastTargetPos = nil
+    State.SmoothedFaceDir = nil
+    State.SmoothCamDist = nil
 
     if not RefreshTargetCache() then
         Unlock()
@@ -1211,51 +1243,103 @@ local function SideDash(side) -- side: -1 esquerda, +1 direita
     local root = State.Root
     if not root then return end
 
-    local up = Vector3.yAxis
-    local dir
-
-    if State.IsLocked and State.CachedTargetRoot then
-        -- Strafe perpendicular ao alvo, com viés pras costas do inimigo
-        local toEnemy = State.CachedTargetRoot.Position - root.Position
-        toEnemy = Vector3.new(toEnemy.X, 0, toEnemy.Z)
-        if toEnemy.Magnitude < 0.1 then return end
-        toEnemy = toEnemy.Unit
-
-        local tangent = toEnemy:Cross(up)
-        if tangent.Magnitude < 0.1 then return end
-        tangent = tangent.Unit * side
-
-        local backBias = Vector3.zero
-        local enemyFwd = State.CachedTargetRoot.CFrame.LookVector
-        enemyFwd = Vector3.new(enemyFwd.X, 0, enemyFwd.Z)
-        if enemyFwd.Magnitude > 0.1 then
-            -- as costas do inimigo ficam no sentido oposto ao que ele olha
-            backBias = -enemyFwd.Unit * CONFIG.DashBackWeight
+    local function EndDash(faceEnemy)
+        if State.Conns.Dash then
+            pcall(function() State.Conns.Dash:Disconnect() end)
+            State.Conns.Dash = nil
         end
+        if faceEnemy then
+            local r, enemy = State.Root, State.CachedTargetRoot
+            if r and enemy then
+                -- corta o embalo horizontal e encara o inimigo (pronto pra atacar)
+                local v = r.AssemblyLinearVelocity
+                r.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+                local look = enemy.Position - r.Position
+                look = Vector3.new(look.X, 0, look.Z)
+                if look.Magnitude > 0.5 then
+                    r.CFrame = CFrame.lookAt(r.Position, r.Position + look.Unit)
+                    State.SmoothedFaceDir = look.Unit
+                end
+            end
+        end
+        task.delay(CONFIG.DashCooldown, function() State.Dashing = false end)
+    end
 
-        dir = tangent * CONFIG.DashTangentWeight + backBias
-        if dir.Magnitude < 0.1 then dir = tangent end
-        dir = dir.Unit
-    else
-        -- Sem lock: dash lateral simples relativo ao personagem
+    -- ── Sem lock: dash lateral simples relativo ao personagem ──
+    if not (State.IsLocked and State.CachedTargetRoot) then
         local rv = root.CFrame.RightVector
         rv = Vector3.new(rv.X, 0, rv.Z)
         if rv.Magnitude < 0.1 then return end
-        dir = rv.Unit * side
+        local dir = rv.Unit * side
+
+        State.Dashing = true
+        local startTime = tick()
+        Conn("Dash", RunService.Heartbeat:Connect(function()
+            local r = State.Root
+            if not r or (tick() - startTime) >= CONFIG.DashDuration then
+                EndDash(false)
+                return
+            end
+            local curY = r.AssemblyLinearVelocity.Y
+            r.AssemblyLinearVelocity = dir * CONFIG.DashSpeed + Vector3.new(0, curY, 0)
+        end))
+        return
     end
 
+    -- ── Lockado: dash GUIADO — persegue o ponto às costas do inimigo ──
+    -- (recalculado a cada frame, então funciona mesmo com o inimigo se movendo)
     State.Dashing = true
     local startTime = tick()
+
     Conn("Dash", RunService.Heartbeat:Connect(function()
         local r = State.Root
-        if not r or (tick() - startTime) >= CONFIG.DashDuration then
-            if State.Conns.Dash then
-                pcall(function() State.Conns.Dash:Disconnect() end)
-                State.Conns.Dash = nil
-            end
-            task.delay(CONFIG.DashCooldown, function() State.Dashing = false end)
+        local enemy = State.IsLocked and State.CachedTargetRoot or nil
+        local elapsed = tick() - startTime
+
+        if not r or not enemy or not enemy.Parent then
+            EndDash(false)
             return
         end
+        if elapsed >= CONFIG.DashMaxDuration then
+            EndDash(true)
+            return
+        end
+
+        -- Ponto às costas: oposto pra onde o inimigo está olhando
+        local enemyPos = enemy.Position
+        local fwd = enemy.CFrame.LookVector
+        fwd = Vector3.new(fwd.X, 0, fwd.Z)
+        local behind
+        if fwd.Magnitude > 0.1 then
+            behind = enemyPos - fwd.Unit * CONFIG.DashBehindDistance
+        else
+            -- fallback: lado oposto ao jogador
+            local away = enemyPos - r.Position
+            away = Vector3.new(away.X, 0, away.Z)
+            if away.Magnitude < 0.1 then
+                EndDash(true)
+                return
+            end
+            behind = enemyPos + away.Unit * CONFIG.DashBehindDistance
+        end
+
+        local toBehind = Vector3.new(behind.X - r.Position.X, 0, behind.Z - r.Position.Z)
+        if toBehind.Magnitude <= CONFIG.DashStopRadius then
+            EndDash(true) -- chegou às costas: para e encara o inimigo
+            return
+        end
+
+        -- Arco: começa tangencial (contorna pelo lado escolhido) e converge pro ponto
+        local dir = toBehind.Unit
+        local t = math.clamp(elapsed / CONFIG.DashMaxDuration, 0, 1)
+        local toEnemyFlat = Vector3.new(enemyPos.X - r.Position.X, 0, enemyPos.Z - r.Position.Z)
+        if toEnemyFlat.Magnitude > 0.1 then
+            local tangent = toEnemyFlat.Unit:Cross(Vector3.yAxis) * side
+            if tangent.Magnitude > 0.1 then
+                dir = (dir + tangent.Unit * (1 - t)).Unit
+            end
+        end
+
         local curY = r.AssemblyLinearVelocity.Y
         r.AssemblyLinearVelocity = dir * CONFIG.DashSpeed + Vector3.new(0, curY, 0)
     end))
@@ -1411,7 +1495,7 @@ local function UpdateCamera(dt)
         if flatDir.Magnitude > 0.1 then flatDir = flatDir.Unit end
     end
 
-    -- Posição da câmera
+    -- Posição ideal da câmera
     local camGoal = playerPos - flatDir * CONFIG.CameraDistance + Vector3.new(0, CONFIG.CameraHeight, 0)
     local focusPoint = playerPos:Lerp(predictedTarget, CONFIG.LookAtBias)
 
@@ -1427,18 +1511,38 @@ local function UpdateCamera(dt)
         fadeAlpha = 1 - InverseLerp(fadeStart, fadeFull, dist)
     end
 
-    -- Wall avoidance para câmera
-    local wallResult = SphereCast(
-        playerPos + Vector3.new(0, 2, 0),
-        camGoal,
-        0.5,
-        GetAllCharactersCached()
-    )
-    if wallResult then
-        camGoal = wallResult.Position + wallResult.Normal * 0.9
-        if camGoal.Y < playerPos.Y + 1.5 then
-            camGoal = Vector3.new(camGoal.X, playerPos.Y + 1.5, camGoal.Z)
+    -- Wall avoidance SUAVIZADO: em vez de saltar entre "atrás da parede" e
+    -- "distância cheia" (o que fazia a câmera tremer), suavizamos a DISTÂNCIA:
+    -- encurta na hora (não atravessa parede), alonga de volta devagar.
+    local camOrigin = playerPos + Vector3.new(0, 2, 0)
+    local toGoal = camGoal - camOrigin
+    local fullDist = toGoal.Magnitude
+    if fullDist > 0.1 then
+        local goalDir = toGoal.Unit
+        local desiredDist = fullDist
+
+        local wallResult = SphereCast(camOrigin, camGoal, 0.5, GetAllCharactersCached())
+        if wallResult then
+            desiredDist = math.max((wallResult.Position - camOrigin).Magnitude - 0.9, 1.5)
         end
+
+        if not State.SmoothCamDist then
+            State.SmoothCamDist = desiredDist
+        elseif desiredDist < State.SmoothCamDist then
+            State.SmoothCamDist = desiredDist -- encurtar: instantâneo (evita clipar)
+        else
+            State.SmoothCamDist = SafeLerp(
+                State.SmoothCamDist, desiredDist,
+                ExpDecay(CONFIG.CamWallRecoverRate, dt)
+            )
+        end
+
+        camGoal = camOrigin + goalDir * State.SmoothCamDist
+    end
+
+    -- Altura mínima sempre (nunca enterra a câmera no chão)
+    if camGoal.Y < playerPos.Y + 1.5 then
+        camGoal = Vector3.new(camGoal.X, playerPos.Y + 1.5, camGoal.Z)
     end
 
     -- Aplica shake
@@ -1450,10 +1554,10 @@ local function UpdateCamera(dt)
         return
     end
 
-    -- Limita o passo por frame pra evitar teleporte/overshoot quando o alvo dá dash
+    -- Limita a velocidade da câmera (studs/s) pra bloquear teleporte sem afetar o follow normal
     local camPos = Camera.CFrame.Position
     local step = camGoal - camPos
-    local maxStep = CONFIG.CameraMaxStep
+    local maxStep = math.max(CONFIG.CameraMaxSpeed * dt, 1)
     if step.Magnitude > maxStep then
         camGoal = camPos + step.Unit * maxStep
     end
@@ -1482,9 +1586,14 @@ local function BuildUI()
     screen.Parent = PlayerGui
 
     -- ═══════════ MENU HUB ═══════════
+    -- Altura adaptativa: nunca maior que a tela (em celular o conteúdo rola)
+    local screenH = screen.AbsoluteSize.Y
+    if screenH <= 0 then screenH = Camera.ViewportSize.Y - 60 end
+    local hubHeight = math.min(440, math.max(200, screenH - 20))
+
     local hubFrame = Instance.new("Frame")
     hubFrame.Name = "HubFrame"
-    hubFrame.Size = UDim2.new(0, 220, 0, 440) -- maior pra caber todos os botões
+    hubFrame.Size = UDim2.new(0, 220, 0, hubHeight)
     hubFrame.Position = State.SavedHubPos or CONFIG.DefaultHubPos
     State.MenuOpen = CONFIG.MenuOpenDefault
     hubFrame.Visible = State.MenuOpen
@@ -1518,12 +1627,18 @@ local function BuildUI()
     hubTitle.TextSize = 14
     hubTitle.Parent = hubFrame
 
-    -- Container para botões (com padding e layout)
-    local btnContainer = Instance.new("Frame")
+    -- Container para botões: ScrollingFrame (rola quando a tela é pequena)
+    local btnContainer = Instance.new("ScrollingFrame")
     btnContainer.Name = "ButtonContainer"
     btnContainer.Size = UDim2.new(1, -20, 1, -45)
     btnContainer.Position = UDim2.new(0, 10, 0, 40)
     btnContainer.BackgroundTransparency = 1
+    btnContainer.BorderSizePixel = 0
+    btnContainer.ScrollBarThickness = 4
+    btnContainer.ScrollBarImageColor3 = Color3.fromRGB(255, 80, 80)
+    btnContainer.ScrollingDirection = Enum.ScrollingDirection.Y
+    btnContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+    btnContainer.AutomaticCanvasSize = Enum.AutomaticCanvasSize.Y
     btnContainer.Parent = hubFrame
 
     local listLayout = Instance.new("UIListLayout")
@@ -1535,7 +1650,7 @@ local function BuildUI()
     -- Helper: cria botão do hub
     local function MakeHubButton(text, color, textColor, order)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 0, 38)
+        btn.Size = UDim2.new(1, -8, 0, 38) -- -8 deixa espaço pra barra de rolagem
         btn.BackgroundColor3 = color
         btn.Text = text
         btn.TextColor3 = textColor or Color3.fromRGB(255, 255, 255)
@@ -1658,6 +1773,7 @@ local function BuildUI()
                     startPos.X.Scale, startPos.X.Offset + delta.X,
                     startPos.Y.Scale, startPos.Y.Offset + delta.Y
                 )
+                ClampToViewport(btn)
             end
         end)
         local c2 = UserInputService.InputEnded:Connect(function(input)
@@ -1774,6 +1890,7 @@ local function BuildUI()
                 startPos.X.Scale, startPos.X.Offset + (input.Position.X - dragStart.X),
                 startPos.Y.Scale, startPos.Y.Offset + (input.Position.Y - dragStart.Y)
             )
+            ClampToViewport(btnFrame)
         end
     end)
 
@@ -2085,6 +2202,8 @@ local function Init()
     -- MouseBehavior gerido dinamicamente
 
     BuildUI()
+    -- Clamp inicial (deferido: AbsoluteSize só é válido após o primeiro layout)
+    task.defer(ReclampAllUI)
 
     if LocalPlayer.Character then
         task.spawn(function() OnCharacter(LocalPlayer.Character) end)
