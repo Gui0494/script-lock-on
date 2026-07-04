@@ -1638,7 +1638,11 @@ local function BuildUI()
     btnContainer.ScrollBarImageColor3 = Color3.fromRGB(255, 80, 80)
     btnContainer.ScrollingDirection = Enum.ScrollingDirection.Y
     btnContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
-    btnContainer.AutomaticCanvasSize = Enum.AutomaticCanvasSize.Y
+    -- A propriedade AutomaticCanvasSize usa o enum Enum.AutomaticSize.
+    -- pcall pra degradar em clientes/executores antigos sem derrubar a UI toda.
+    pcall(function()
+        btnContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    end)
     btnContainer.Parent = hubFrame
 
     local listLayout = Instance.new("UIListLayout")
@@ -2201,9 +2205,15 @@ end)
 local function Init()
     -- MouseBehavior gerido dinamicamente
 
-    BuildUI()
-    -- Clamp inicial (deferido: AbsoluteSize só é válido após o primeiro layout)
-    task.defer(ReclampAllUI)
+    -- BuildUI isolado: se algo na UI falhar, o resto do sistema (câmera, input)
+    -- ainda conecta, em vez de deixar tudo silencioso
+    local uiOk, uiErr = pcall(BuildUI)
+    if not uiOk then
+        warn("[Lock-On] Falha ao montar a UI: " .. tostring(uiErr))
+    else
+        -- Clamp inicial (deferido: AbsoluteSize só é válido após o primeiro layout)
+        task.defer(ReclampAllUI)
+    end
 
     if LocalPlayer.Character then
         task.spawn(function() OnCharacter(LocalPlayer.Character) end)
@@ -2239,4 +2249,8 @@ local function Init()
     print("══════════════════════════════════════════════════")
 end
 
-Init()
+-- Init protegido: qualquer erro vira aviso no console em vez de matar o script
+local initOk, initErr = pcall(Init)
+if not initOk then
+    warn("[Lock-On] Erro no Init: " .. tostring(initErr))
+end
