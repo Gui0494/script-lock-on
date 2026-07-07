@@ -32,6 +32,7 @@ local Players            = game:GetService("Players")
 local RunService         = game:GetService("RunService")
 local UserInputService   = game:GetService("UserInputService")
 local Lighting           = game:GetService("Lighting")
+local TweenService       = game:GetService("TweenService")
 
 local VirtualInput
 pcall(function() VirtualInput = game:GetService("VirtualInputManager") end)
@@ -145,6 +146,38 @@ local CONFIG = {
     SecondThreatTimeout  = 3.0,  -- segundos sem novo dano antes de sumir a seta
     SecondThreatRange    = 120,  -- distância máxima pra considerar segundo atacante
 
+    -- ▸ Auto Black Flash (dash pras costas + combo do "3")
+    BFKey                = Enum.KeyCode.Three, -- tecla do black flash no jogo
+    BFGap                = 0.28,  -- intervalo entre os dois toques
+    BFCooldown           = 0.6,   -- cooldown entre chains
+    BFRange              = 60,    -- alcance pra pegar alvo quando não tá lockado
+    BFAutoKey            = Enum.KeyCode.V, -- tecla pra disparar o chain manualmente
+
+    -- ▸ Auto Dodge (Haruta = M1 no impacto | Charles = perfect block no impacto)
+    AutoDodge            = false,
+    BlockKey             = Enum.KeyCode.F,   -- Charles bloqueia segurando F
+    BlockHoldTime        = 0.12,             -- quanto tempo segura o F no perfect block
+    -- Detecta o ataque pelo NOME da animação (ex.: "Yuji - M1_1", "Gojo - M1_2").
+    -- Casa por substring → pega o M1 de qualquer personagem sem precisar de assetid.
+    AttackAnimNames      = { "M1" },
+    FinisherNames        = { "M1_4", "M1_5", "Crushing" }, -- finalizadores (impacto mais lento)
+    M1Windup             = 0.22,  -- impacto do M1 (~0.20–0.23s)
+    M1FinisherWindup     = 0.32,  -- impacto do finalizador (~0.28–0.35s)
+    ReactionLead         = 0.04,  -- antecipa a reação (ping/frames)
+    DodgeRange           = 14,    -- distância máxima do inimigo pra reagir
+    DodgeCooldown        = 0.4,   -- cooldown entre esquivas
+
+    -- ▸ Tema do menu (preto/cinza)
+    ThemeBg              = Color3.fromRGB(18, 18, 22),
+    ThemePanel           = Color3.fromRGB(30, 30, 36),
+    ThemePanelLight      = Color3.fromRGB(44, 44, 52),
+    ThemeText            = Color3.fromRGB(220, 220, 228),
+    ThemeSubText         = Color3.fromRGB(150, 150, 160),
+    ThemeAccent          = Color3.fromRGB(235, 235, 240),
+    ThemeStroke          = Color3.fromRGB(70, 70, 82),
+    ThemeOn              = Color3.fromRGB(60, 120, 90),
+    ThemeOff             = Color3.fromRGB(70, 70, 80),
+
     -- ▸ Side Dash
     DashSpeed            = 90,    -- studs/s durante o dash
     DashDuration         = 0.18,  -- duração do dash lateral (sem lock)
@@ -222,6 +255,16 @@ local State = {
     Dashing              = false,
     SavedDashLeftPos     = nil,
     SavedDashRightPos    = nil,
+
+    -- Black flash
+    BFActive             = false,
+    BFLastTime           = 0,
+    AutoBF               = false,
+
+    -- Auto dodge
+    DodgeChar            = "auto",   -- "auto" | "haruta" | "charles"
+    DodgeLastTime        = 0,
+    DodgePending         = false,
 }
 
 -- ══════════════════════════════════════════════════════
@@ -1236,25 +1279,33 @@ CycleTarget = function(direction)
 end
 
 -- ══════════════════════════════════════════════════════
--- SIDE DASH (lateral; lockado = contorna pras costas do alvo)
+-- DASH GUIADO PRAS COSTAS (reutilizado por SideDash e Black Flash)
 -- ══════════════════════════════════════════════════════
-local function SideDash(side) -- side: -1 esquerda, +1 direita
-    if State.Dashing or not CONFIG.SystemEnabled then return end
-    local root = State.Root
-    if not root then return end
+-- Persegue o ponto às costas de `targetRoot` a cada frame (funciona com o alvo
+-- em movimento), arca pelo lado `side` e para no raio, encarando o inimigo.
+-- Chama onArrive() ao chegar. Retorna false se não pôde iniciar.
+local function DashBehindTarget(targetRoot, side, onArrive)
+    if State.Dashing or not State.Root or not targetRoot or not targetRoot.Parent then
+        return false
+    end
+    if side ~= -1 and side ~= 1 then
+        side = (math.random(0, 1) == 0) and -1 or 1
+    end
+
+    State.Dashing = true
+    local startTime = tick()
 
     local function EndDash(faceEnemy)
         if State.Conns.Dash then
             pcall(function() State.Conns.Dash:Disconnect() end)
             State.Conns.Dash = nil
         end
-        if faceEnemy then
-            local r, enemy = State.Root, State.CachedTargetRoot
-            if r and enemy then
-                -- corta o embalo horizontal e encara o inimigo (pronto pra atacar)
-                local v = r.AssemblyLinearVelocity
-                r.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
-                local look = enemy.Position - r.Position
+        local r = State.Root
+        if r then
+            local v = r.AssemblyLinearVelocity
+            r.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+            if faceEnemy and targetRoot and targetRoot.Parent then
+                local look = targetRoot.Position - r.Position
                 look = Vector3.new(look.X, 0, look.Z)
                 if look.Magnitude > 0.5 then
                     r.CFrame = CFrame.lookAt(r.Position, r.Position + look.Unit)
@@ -1263,40 +1314,14 @@ local function SideDash(side) -- side: -1 esquerda, +1 direita
             end
         end
         task.delay(CONFIG.DashCooldown, function() State.Dashing = false end)
+        if faceEnemy and onArrive then onArrive() end
     end
-
-    -- ── Sem lock: dash lateral simples relativo ao personagem ──
-    if not (State.IsLocked and State.CachedTargetRoot) then
-        local rv = root.CFrame.RightVector
-        rv = Vector3.new(rv.X, 0, rv.Z)
-        if rv.Magnitude < 0.1 then return end
-        local dir = rv.Unit * side
-
-        State.Dashing = true
-        local startTime = tick()
-        Conn("Dash", RunService.Heartbeat:Connect(function()
-            local r = State.Root
-            if not r or (tick() - startTime) >= CONFIG.DashDuration then
-                EndDash(false)
-                return
-            end
-            local curY = r.AssemblyLinearVelocity.Y
-            r.AssemblyLinearVelocity = dir * CONFIG.DashSpeed + Vector3.new(0, curY, 0)
-        end))
-        return
-    end
-
-    -- ── Lockado: dash GUIADO — persegue o ponto às costas do inimigo ──
-    -- (recalculado a cada frame, então funciona mesmo com o inimigo se movendo)
-    State.Dashing = true
-    local startTime = tick()
 
     Conn("Dash", RunService.Heartbeat:Connect(function()
         local r = State.Root
-        local enemy = State.IsLocked and State.CachedTargetRoot or nil
         local elapsed = tick() - startTime
 
-        if not r or not enemy or not enemy.Parent then
+        if not r or not targetRoot or not targetRoot.Parent then
             EndDash(false)
             return
         end
@@ -1306,26 +1331,22 @@ local function SideDash(side) -- side: -1 esquerda, +1 direita
         end
 
         -- Ponto às costas: oposto pra onde o inimigo está olhando
-        local enemyPos = enemy.Position
-        local fwd = enemy.CFrame.LookVector
+        local enemyPos = targetRoot.Position
+        local fwd = targetRoot.CFrame.LookVector
         fwd = Vector3.new(fwd.X, 0, fwd.Z)
         local behind
         if fwd.Magnitude > 0.1 then
             behind = enemyPos - fwd.Unit * CONFIG.DashBehindDistance
         else
-            -- fallback: lado oposto ao jogador
             local away = enemyPos - r.Position
             away = Vector3.new(away.X, 0, away.Z)
-            if away.Magnitude < 0.1 then
-                EndDash(true)
-                return
-            end
+            if away.Magnitude < 0.1 then EndDash(true) return end
             behind = enemyPos + away.Unit * CONFIG.DashBehindDistance
         end
 
         local toBehind = Vector3.new(behind.X - r.Position.X, 0, behind.Z - r.Position.Z)
         if toBehind.Magnitude <= CONFIG.DashStopRadius then
-            EndDash(true) -- chegou às costas: para e encara o inimigo
+            EndDash(true)
             return
         end
 
@@ -1343,6 +1364,249 @@ local function SideDash(side) -- side: -1 esquerda, +1 direita
         local curY = r.AssemblyLinearVelocity.Y
         r.AssemblyLinearVelocity = dir * CONFIG.DashSpeed + Vector3.new(0, curY, 0)
     end))
+    return true
+end
+
+-- ══════════════════════════════════════════════════════
+-- SIDE DASH (lateral; lockado = contorna pras costas do alvo)
+-- ══════════════════════════════════════════════════════
+local function SideDash(side) -- side: -1 esquerda, +1 direita
+    if State.Dashing or not CONFIG.SystemEnabled then return end
+    local root = State.Root
+    if not root then return end
+
+    -- Lockado: usa o dash guiado pras costas
+    if State.IsLocked and State.CachedTargetRoot then
+        DashBehindTarget(State.CachedTargetRoot, side)
+        return
+    end
+
+    -- Sem lock: dash lateral simples relativo ao personagem
+    local rv = root.CFrame.RightVector
+    rv = Vector3.new(rv.X, 0, rv.Z)
+    if rv.Magnitude < 0.1 then return end
+    local dir = rv.Unit * side
+
+    State.Dashing = true
+    local startTime = tick()
+    Conn("Dash", RunService.Heartbeat:Connect(function()
+        local r = State.Root
+        if not r or (tick() - startTime) >= CONFIG.DashDuration then
+            if State.Conns.Dash then
+                pcall(function() State.Conns.Dash:Disconnect() end)
+                State.Conns.Dash = nil
+            end
+            task.delay(CONFIG.DashCooldown, function() State.Dashing = false end)
+            return
+        end
+        local curY = r.AssemblyLinearVelocity.Y
+        r.AssemblyLinearVelocity = dir * CONFIG.DashSpeed + Vector3.new(0, curY, 0)
+    end))
+end
+
+-- ══════════════════════════════════════════════════════
+-- AUTO BLACK FLASH (dash pras costas + combo do "3")
+-- ══════════════════════════════════════════════════════
+-- Helper único de input de tecla (isolado, sob pcall) — não mexe em câmera/mouse
+local function TapKey(keyCode)
+    pcall(function()
+        if VirtualInput then
+            VirtualInput:SendKeyEvent(true, keyCode, false, game)
+            task.wait(0.03)
+            VirtualInput:SendKeyEvent(false, keyCode, false, game)
+        end
+    end)
+end
+
+-- Segura uma tecla por `dur` segundos (Charles bloqueia segurando F)
+local function HoldKey(keyCode, dur)
+    task.spawn(function()
+        pcall(function()
+            if VirtualInput then
+                VirtualInput:SendKeyEvent(true, keyCode, false, game)
+                task.wait(dur)
+                VirtualInput:SendKeyEvent(false, keyCode, false, game)
+            end
+        end)
+    end)
+end
+
+-- Combo: aperta 3 → espera 0.28s → aperta 3
+local function DoBlackFlashCombo()
+    TapKey(CONFIG.BFKey)
+    task.wait(CONFIG.BFGap)
+    TapKey(CONFIG.BFKey)
+end
+
+-- Alvo do black flash: o lock atual, senão o inimigo mais próximo no range
+local function GetBFTarget()
+    if State.IsLocked and State.CachedTargetRoot then return State.CachedTargetRoot end
+    if not State.Root then return nil end
+    local best, bestDist = nil, CONFIG.BFRange
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and Alive(p) then
+            local _, root = GetParts(p)
+            if root then
+                local d = (State.Root.Position - root.Position).Magnitude
+                if d < bestDist then bestDist = d; best = root end
+            end
+        end
+    end
+    return best
+end
+
+-- Chain completa: contorna pras costas e dá o black flash.
+-- Guard State.BFActive + cooldown impedem reentrância (o que "bugava a tela").
+local function AutoBlackFlash()
+    if State.BFActive or not CONFIG.SystemEnabled or not State.Root then return end
+    if tick() - State.BFLastTime < CONFIG.BFCooldown then return end
+
+    local targetRoot = GetBFTarget()
+    if not targetRoot then return end
+
+    State.BFActive = true
+    State.BFLastTime = tick()
+
+    local fired = false
+    local function fire()
+        if fired then return end
+        fired = true
+        task.spawn(function()
+            DoBlackFlashCombo()
+            State.BFLastTime = tick()
+            State.BFActive = false
+        end)
+    end
+
+    -- Dash pras costas; ao chegar, dispara o combo. Se não pôde dashar, dispara já.
+    if not DashBehindTarget(targetRoot, nil, fire) then
+        fire()
+    end
+end
+
+-- ══════════════════════════════════════════════════════
+-- AUTO DODGE (Haruta = M1 no impacto | Charles = block no impacto)
+-- ══════════════════════════════════════════════════════
+-- A "esquiva" é consequência: reagir no instante do golpe inimigo.
+--   Haruta  → dá M1 (LMB) no impacto
+--   Charles → dá block (perfect block) no impacto → o jogo esquiva
+-- ►► Sem os AnimationIds/tecla de block reais, isto é um framework ajustável. ◄◄
+
+-- Descobre o personagem equipado (best-effort; senão usa o escolhido no menu)
+local function GetDodgeChar()
+    if State.DodgeChar == "haruta" or State.DodgeChar == "charles" then
+        return State.DodgeChar
+    end
+    -- auto: procura o nome em textos/valores do player (best-effort)
+    local found = nil
+    pcall(function()
+        local scan = {}
+        if PlayerGui then for _, d in ipairs(PlayerGui:GetDescendants()) do scan[#scan+1] = d end end
+        if LocalPlayer.Character then for _, d in ipairs(LocalPlayer.Character:GetDescendants()) do scan[#scan+1] = d end end
+        for _, d in ipairs(scan) do
+            local txt = (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text
+                or (d:IsA("StringValue") and d.Value) or nil
+            if txt then
+                local low = string.lower(txt)
+                if string.find(low, "haruta") or string.find(low, "coward") then found = "haruta"; break end
+                if string.find(low, "charles") or string.find(low, "mangaka") then found = "charles"; break end
+            end
+        end
+    end)
+    return found
+end
+
+local function TriggerDodge()
+    local char = GetDodgeChar()
+    if not char then return end
+    if char == "haruta" then
+        SimulateClick()                              -- M1 = clique esquerdo
+    elseif char == "charles" then
+        HoldKey(CONFIG.BlockKey, CONFIG.BlockHoldTime) -- perfect block (segura F)
+    end
+end
+
+-- true se `name` contém algum dos padrões (case-insensitive)
+local function NameHasAny(name, patterns)
+    if not name then return false end
+    local low = string.lower(name)
+    for _, p in ipairs(patterns) do
+        if string.find(low, string.lower(p), 1, true) then return true end
+    end
+    return false
+end
+
+-- Chamado quando um inimigo perto inicia um ataque: agenda a reação no impacto.
+-- `windup` = tempo estimado até o hit conectar (varia por golpe/finalizador).
+local function OnEnemyAttack(enemyRoot, windup)
+    if not CONFIG.AutoDodge or State.DodgePending or not State.Root then return end
+    if tick() - State.DodgeLastTime < CONFIG.DodgeCooldown then return end
+    if not GetDodgeChar() then return end
+
+    local toMe = State.Root.Position - enemyRoot.Position
+    local dist = toMe.Magnitude
+    if dist > CONFIG.DodgeRange then return end
+    -- inimigo tem que estar virado pra mim (senão o golpe não é em mim)
+    if dist > 0.1 and enemyRoot.CFrame.LookVector:Dot(toMe.Unit) < 0.2 then return end
+
+    State.DodgePending = true
+    local delay = math.max((windup or CONFIG.M1Windup) - CONFIG.ReactionLead, 0)
+    task.delay(delay, function()
+        State.DodgeLastTime = tick()
+        TriggerDodge()
+        task.delay(CONFIG.DodgeCooldown, function() State.DodgePending = false end)
+    end)
+end
+
+-- Liga o listener de animação de ataque em cada inimigo (rebind no respawn)
+local dodgeAnimConns = {}
+local function BindEnemyAnimator(player)
+    if dodgeAnimConns[player] then
+        pcall(function() dodgeAnimConns[player]:Disconnect() end)
+        dodgeAnimConns[player] = nil
+    end
+    local char = player.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return end
+
+    dodgeAnimConns[player] = animator.AnimationPlayed:Connect(function(track)
+        if not CONFIG.AutoDodge then return end
+        -- As animações têm nome tipo "Yuji - M1_1" / "Gojo - M1_2".
+        -- Casa pelo nome (track e Animation), pegando o M1 de qualquer char.
+        local nm = (track and track.Name) or ""
+        local animNm = (track and track.Animation and track.Animation.Name) or ""
+        if not (NameHasAny(nm, CONFIG.AttackAnimNames) or NameHasAny(animNm, CONFIG.AttackAnimNames)) then
+            return
+        end
+
+        -- Finalizador (M1_4/etc.) tem impacto mais lento
+        local isFinisher = NameHasAny(nm, CONFIG.FinisherNames) or NameHasAny(animNm, CONFIG.FinisherNames)
+        local windup = isFinisher and CONFIG.M1FinisherWindup or CONFIG.M1Windup
+
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then OnEnemyAttack(root, windup) end
+    end)
+end
+
+local function SetupAutoDodge()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            BindEnemyAnimator(p)
+            p.CharacterAdded:Connect(function()
+                task.wait(0.3)
+                BindEnemyAnimator(p)
+            end)
+        end
+    end
+    Players.PlayerAdded:Connect(function(p)
+        if p == LocalPlayer then return end
+        p.CharacterAdded:Connect(function()
+            task.wait(0.3)
+            BindEnemyAnimator(p)
+        end)
+    end)
 end
 
 -- ══════════════════════════════════════════════════════
@@ -1585,132 +1849,188 @@ local function BuildUI()
     screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screen.Parent = PlayerGui
 
-    -- ═══════════ MENU HUB ═══════════
-    -- Altura adaptativa: nunca maior que a tela (em celular o conteúdo rola)
+    -- ═══════════ MENU HUB (janela em abas, tema preto/cinza) ═══════════
     local screenH = screen.AbsoluteSize.Y
     if screenH <= 0 then screenH = Camera.ViewportSize.Y - 60 end
-    local hubHeight = math.min(440, math.max(200, screenH - 20))
+    local hubHeight = math.min(430, math.max(240, screenH - 20))
+    local HUB_W, SIDE_W = 322, 96
 
     local hubFrame = Instance.new("Frame")
     hubFrame.Name = "HubFrame"
-    hubFrame.Size = UDim2.new(0, 220, 0, hubHeight)
+    hubFrame.Size = UDim2.new(0, HUB_W, 0, hubHeight)
     hubFrame.Position = State.SavedHubPos or CONFIG.DefaultHubPos
     State.MenuOpen = CONFIG.MenuOpenDefault
     hubFrame.Visible = State.MenuOpen
-    hubFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-    hubFrame.BackgroundTransparency = 0.05
+    hubFrame.BackgroundColor3 = CONFIG.ThemeBg
+    hubFrame.BackgroundTransparency = 0.02
     hubFrame.BorderSizePixel = 0
     hubFrame.Active = true
     hubFrame.Parent = screen
-    Instance.new("UICorner", hubFrame).CornerRadius = UDim.new(0, 10)
+    Instance.new("UICorner", hubFrame).CornerRadius = UDim.new(0, 12)
+
+    local hubScale = Instance.new("UIScale")
+    hubScale.Parent = hubFrame
 
     local hubStroke = Instance.new("UIStroke")
-    hubStroke.Color = Color3.fromRGB(255, 60, 60)
-    hubStroke.Thickness = 1.5
-    hubStroke.Transparency = 0.3
+    hubStroke.Color = CONFIG.ThemeStroke
+    hubStroke.Thickness = 1
+    hubStroke.Transparency = 0.15
     hubStroke.Parent = hubFrame
 
-    -- Título como handle de drag (não o frame inteiro, evita conflito com botões)
-    local hubDragHandle = Instance.new("Frame")
-    hubDragHandle.Name = "DragHandle"
-    hubDragHandle.Size = UDim2.new(1, 0, 0, 35)
-    hubDragHandle.BackgroundTransparency = 1
-    hubDragHandle.Parent = hubFrame
-    MakeDraggable(hubFrame) -- drag no frame todo funciona pq botões absorvem input
+    -- Barra de título (também é o handle de drag)
+    local topBar = Instance.new("Frame")
+    topBar.Name = "TopBar"
+    topBar.Size = UDim2.new(1, 0, 0, 34)
+    topBar.BackgroundColor3 = CONFIG.ThemePanel
+    topBar.BorderSizePixel = 0
+    topBar.Parent = hubFrame
+    Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 12)
 
     local hubTitle = Instance.new("TextLabel")
-    hubTitle.Size = UDim2.new(1, 0, 0, 35)
+    hubTitle.Size = UDim2.new(1, -16, 1, 0)
+    hubTitle.Position = UDim2.new(0, 12, 0, 0)
     hubTitle.BackgroundTransparency = 1
-    hubTitle.Text = "⚡ LOCK-ON HUB v6.2"
-    hubTitle.TextColor3 = Color3.fromRGB(255, 80, 80)
+    hubTitle.Text = "LOCK-ON  •  HUB"
+    hubTitle.TextXAlignment = Enum.TextXAlignment.Left
+    hubTitle.TextColor3 = CONFIG.ThemeText
     hubTitle.Font = Enum.Font.GothamBold
-    hubTitle.TextSize = 14
-    hubTitle.Parent = hubFrame
+    hubTitle.TextSize = 13
+    hubTitle.Parent = topBar
+    MakeDraggable(hubFrame)
 
-    -- Container para botões: ScrollingFrame (rola quando a tela é pequena)
-    local btnContainer = Instance.new("ScrollingFrame")
-    btnContainer.Name = "ButtonContainer"
-    btnContainer.Size = UDim2.new(1, -20, 1, -45)
-    btnContainer.Position = UDim2.new(0, 10, 0, 40)
-    btnContainer.BackgroundTransparency = 1
-    btnContainer.BorderSizePixel = 0
-    btnContainer.ScrollBarThickness = 4
-    btnContainer.ScrollBarImageColor3 = Color3.fromRGB(255, 80, 80)
-    btnContainer.ScrollingDirection = Enum.ScrollingDirection.Y
-    btnContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
-    -- A propriedade AutomaticCanvasSize usa o enum Enum.AutomaticSize.
-    -- pcall pra degradar em clientes/executores antigos sem derrubar a UI toda.
-    pcall(function()
-        btnContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    end)
-    btnContainer.Parent = hubFrame
+    -- Sidebar de abas
+    local sidebar = Instance.new("Frame")
+    sidebar.Name = "Sidebar"
+    sidebar.Size = UDim2.new(0, SIDE_W, 1, -44)
+    sidebar.Position = UDim2.new(0, 6, 0, 40)
+    sidebar.BackgroundColor3 = CONFIG.ThemePanel
+    sidebar.BorderSizePixel = 0
+    sidebar.Parent = hubFrame
+    Instance.new("UICorner", sidebar).CornerRadius = UDim.new(0, 8)
+    local sideList = Instance.new("UIListLayout")
+    sideList.Padding = UDim.new(0, 4)
+    sideList.SortOrder = Enum.SortOrder.LayoutOrder
+    sideList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    sideList.Parent = sidebar
+    local sidePad = Instance.new("UIPadding")
+    sidePad.PaddingTop = UDim.new(0, 6)
+    sidePad.Parent = sidebar
 
-    local listLayout = Instance.new("UIListLayout")
-    listLayout.Parent = btnContainer
-    listLayout.Padding = UDim.new(0, 8)
-    listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    -- Área de conteúdo
+    local content = Instance.new("Frame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, -(SIDE_W + 18), 1, -44)
+    content.Position = UDim2.new(0, SIDE_W + 12, 0, 40)
+    content.BackgroundTransparency = 1
+    content.Parent = hubFrame
 
-    -- Helper: cria botão do hub
-    local function MakeHubButton(text, color, textColor, order)
+    -- Sistema de abas
+    local tabs = {}
+    local tabOrder = 0
+    local function SelectTab(name)
+        for n, t in pairs(tabs) do
+            local on = (n == name)
+            t.page.Visible = on
+            t.btn.BackgroundColor3 = on and CONFIG.ThemePanelLight or CONFIG.ThemePanel
+            t.btn.TextColor3 = on and CONFIG.ThemeText or CONFIG.ThemeSubText
+        end
+    end
+    local function MakeTab(name)
+        tabOrder = tabOrder + 1
+        local tbtn = Instance.new("TextButton")
+        tbtn.Size = UDim2.new(1, -8, 0, 30)
+        tbtn.BackgroundColor3 = CONFIG.ThemePanel
+        tbtn.Text = name
+        tbtn.TextColor3 = CONFIG.ThemeSubText
+        tbtn.Font = Enum.Font.GothamBold
+        tbtn.TextSize = 11
+        tbtn.AutoButtonColor = false
+        tbtn.LayoutOrder = tabOrder
+        tbtn.Parent = sidebar
+        Instance.new("UICorner", tbtn).CornerRadius = UDim.new(0, 6)
+
+        local page = Instance.new("ScrollingFrame")
+        page.Name = name .. "Page"
+        page.Size = UDim2.new(1, 0, 1, 0)
+        page.BackgroundTransparency = 1
+        page.BorderSizePixel = 0
+        page.ScrollBarThickness = 3
+        page.ScrollBarImageColor3 = CONFIG.ThemeStroke
+        page.ScrollingDirection = Enum.ScrollingDirection.Y
+        page.CanvasSize = UDim2.new(0, 0, 0, 0)
+        page.Visible = false
+        page.Parent = content
+        pcall(function() page.AutomaticCanvasSize = Enum.AutomaticSize.Y end)
+        local ll = Instance.new("UIListLayout")
+        ll.Padding = UDim.new(0, 7)
+        ll.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        ll.SortOrder = Enum.SortOrder.LayoutOrder
+        ll.Parent = page
+
+        tabs[name] = { btn = tbtn, page = page }
+        tbtn.MouseButton1Click:Connect(function() SelectTab(name) end)
+        return page
+    end
+
+    -- Cria botão dentro de uma página
+    local function MakeHubButton(page, text, color, textColor)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, -8, 0, 38) -- -8 deixa espaço pra barra de rolagem
-        btn.BackgroundColor3 = color
+        btn.Size = UDim2.new(1, -6, 0, 34)
+        btn.BackgroundColor3 = color or CONFIG.ThemePanel
         btn.Text = text
-        btn.TextColor3 = textColor or Color3.fromRGB(255, 255, 255)
+        btn.TextColor3 = textColor or CONFIG.ThemeText
         btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 13
-        btn.LayoutOrder = order
+        btn.TextSize = 12
         btn.AutoButtonColor = true
-        btn.Parent = btnContainer
+        btn.Parent = page
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
         return btn
     end
 
-    -- Botão 1: Toggle System
-    local btnToggle = MakeHubButton(
-        CONFIG.SystemEnabled and "ON — Sistema Ativo" or "OFF — Sistema Desativado",
-        CONFIG.SystemEnabled and Color3.fromRGB(40, 120, 40) or Color3.fromRGB(120, 40, 40),
-        nil, 1
-    )
+    local pageCombat = MakeTab("Combate")
+    local pageCam    = MakeTab("Câmera")
+    local pageDashT  = MakeTab("Dash")
+    local pageBF     = MakeTab("B.Flash")
+    local pageDodge  = MakeTab("Dodge")
+    local pageExtra  = MakeTab("Extra")
 
-    -- Botão 2: Otimizar FPS
-    local btnFPS = MakeHubButton("⚙ Otimizar FPS", Color3.fromRGB(35, 35, 50), Color3.fromRGB(180, 180, 255), 2)
+    local ON, OFF = CONFIG.ThemeOn, CONFIG.ThemeOff
 
-    -- Botão 3: Toggle Black Flash Btn
-    local btnBF = MakeHubButton("⚫ Toggle Black Flash", Color3.fromRGB(20, 20, 20), Color3.fromRGB(255, 60, 60), 3)
-    local bfStroke = Instance.new("UIStroke")
-    bfStroke.Color = Color3.fromRGB(255, 0, 0)
-    bfStroke.Thickness = 1
-    bfStroke.Parent = btnBF
+    -- ── Aba Combate ──
+    local btnToggle = MakeHubButton(pageCombat,
+        CONFIG.SystemEnabled and "Sistema: ON" or "Sistema: OFF",
+        CONFIG.SystemEnabled and ON or OFF)
+    local btnMode = MakeHubButton(pageCombat, "Modo: " .. string.upper(State.LockMode), CONFIG.ThemePanelLight)
+    local btnAutoLock = MakeHubButton(pageCombat,
+        CONFIG.AutoLockOnHit and "Auto-Lock ao Apanhar: ON" or "Auto-Lock ao Apanhar: OFF",
+        CONFIG.AutoLockOnHit and ON or OFF)
 
-    -- Botão 4: Moveset Troll
-    local btnMoveset = MakeHubButton("🎭 Moveset Troll", Color3.fromRGB(80, 40, 120), nil, 4)
+    -- ── Aba Câmera ──
+    local btnFPS = MakeHubButton(pageCam, "Otimizar FPS", CONFIG.ThemePanelLight)
 
-    -- Botão 5: Lock Mode Toggle
-    local btnMode = MakeHubButton(
-        "Mode: " .. string.upper(State.LockMode),
-        Color3.fromRGB(40, 50, 80),
-        Color3.fromRGB(150, 200, 255),
-        5
-    )
+    -- ── Aba Dash ──
+    local btnDash = MakeHubButton(pageDashT,
+        CONFIG.ShowDashButtonsDefault and "Side Dash: ON" or "Side Dash: OFF",
+        CONFIG.ShowDashButtonsDefault and ON or OFF)
 
-    -- Botão 6: Auto-Lock ao Apanhar (toggle)
-    local btnAutoLock = MakeHubButton(
-        CONFIG.AutoLockOnHit and "🎯 Auto-Lock ao Apanhar: ON" or "🎯 Auto-Lock ao Apanhar: OFF",
-        CONFIG.AutoLockOnHit and Color3.fromRGB(40, 110, 90) or Color3.fromRGB(70, 70, 80),
-        nil, 6
-    )
+    -- ── Aba Black Flash ──
+    local btnAutoBF = MakeHubButton(pageBF,
+        State.AutoBF and "Auto Black Flash: ON" or "Auto Black Flash: OFF",
+        State.AutoBF and ON or OFF)
+    local btnBF = MakeHubButton(pageBF, "Mostrar botão B.Flash", CONFIG.ThemePanelLight)
 
-    -- Botão 7: Side Dash (toggle visibilidade dos botões de dash)
-    local btnDash = MakeHubButton(
-        CONFIG.ShowDashButtonsDefault and "💨 Side Dash: ON" or "💨 Side Dash: OFF",
-        CONFIG.ShowDashButtonsDefault and Color3.fromRGB(25, 60, 90) or Color3.fromRGB(70, 70, 80),
-        Color3.fromRGB(140, 200, 255), 7
-    )
+    -- ── Aba Dodge ──
+    local dodgeLabels = { auto = "Auto", haruta = "Haruta", charles = "Charles" }
+    local btnDodgeChar = MakeHubButton(pageDodge, "Char: " .. dodgeLabels[State.DodgeChar], CONFIG.ThemePanelLight)
+    local btnAutoDodge = MakeHubButton(pageDodge,
+        CONFIG.AutoDodge and "Auto Dodge: ON" or "Auto Dodge: OFF",
+        CONFIG.AutoDodge and ON or OFF)
 
-    -- Botão 8: Resetar posições dos botões
-    local btnReset = MakeHubButton("↺ Resetar Posições", Color3.fromRGB(60, 45, 25), Color3.fromRGB(255, 210, 150), 8)
+    -- ── Aba Extra ──
+    local btnMoveset = MakeHubButton(pageExtra, "Moveset Troll", CONFIG.ThemePanelLight)
+    local btnReset = MakeHubButton(pageExtra, "Resetar Posições", CONFIG.ThemePanelLight)
+
+    SelectTab("Combate")
 
     -- ═══════════ BLACK FLASH FLOATING BUTTON ═══════════
     MiniBlackFlashBtn = Instance.new("TextButton")
@@ -1740,19 +2060,42 @@ local function BuildUI()
     menuToggle.Name = "MenuToggle"
     menuToggle.Size = UDim2.new(0, CONFIG.MenuToggleSize, 0, CONFIG.MenuToggleSize)
     menuToggle.Position = State.SavedMenuTogglePos or CONFIG.DefaultMenuTogglePos
-    menuToggle.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+    menuToggle.BackgroundColor3 = CONFIG.ThemePanel
     menuToggle.Text = "☰"
-    menuToggle.TextColor3 = Color3.fromRGB(255, 90, 90)
+    menuToggle.TextColor3 = CONFIG.ThemeText
     menuToggle.TextScaled = true
     menuToggle.Font = Enum.Font.GothamBold
     menuToggle.Active = true
     menuToggle.Parent = screen
     Instance.new("UICorner", menuToggle).CornerRadius = UDim.new(0, 10)
     local mtStroke = Instance.new("UIStroke")
-    mtStroke.Color = Color3.fromRGB(255, 60, 60)
-    mtStroke.Thickness = 1.5
-    mtStroke.Transparency = 0.3
+    mtStroke.Color = CONFIG.ThemeStroke
+    mtStroke.Thickness = 1
+    mtStroke.Transparency = 0.15
     mtStroke.Parent = menuToggle
+
+    -- Abre/fecha com animação sutil (scale + fade)
+    local function OpenMenu()
+        State.MenuOpen = true
+        hubFrame.Visible = true
+        ClampToViewport(hubFrame)
+        hubScale.Scale = 0.92
+        hubFrame.BackgroundTransparency = 0.5
+        TweenService:Create(hubScale, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+        TweenService:Create(hubFrame, TweenInfo.new(0.18), { BackgroundTransparency = 0.02 }):Play()
+        menuToggle.BackgroundColor3 = CONFIG.ThemePanelLight
+    end
+    local function CloseMenu()
+        State.MenuOpen = false
+        local tw = TweenService:Create(hubScale, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.92 })
+        TweenService:Create(hubFrame, TweenInfo.new(0.14), { BackgroundTransparency = 1 }):Play()
+        tw:Play()
+        tw.Completed:Once(function()
+            if not State.MenuOpen then hubFrame.Visible = false end
+        end)
+        menuToggle.BackgroundColor3 = CONFIG.ThemePanel
+    end
+    if State.MenuOpen then OpenMenu() end
 
     -- Helper: botão flutuante com tap (ação) vs arrasto (mover) + clamp
     local function WireTapDrag(btn, onTap, onMoved)
@@ -1799,12 +2142,7 @@ local function BuildUI()
     end
 
     WireTapDrag(menuToggle, function()
-        State.MenuOpen = not State.MenuOpen
-        hubFrame.Visible = State.MenuOpen
-        menuToggle.BackgroundColor3 = State.MenuOpen
-            and Color3.fromRGB(200, 50, 50)
-            or Color3.fromRGB(20, 20, 28)
-        if State.MenuOpen then ClampToViewport(hubFrame) end
+        if State.MenuOpen then CloseMenu() else OpenMenu() end
     end, function(b)
         State.SavedMenuTogglePos = b.Position
     end)
@@ -1947,81 +2285,85 @@ local function BuildUI()
     end)
 
     -- ═══════════ HUB BUTTON ACTIONS ═══════════
+    -- Combate
     btnToggle.MouseButton1Click:Connect(function()
         CONFIG.SystemEnabled = not CONFIG.SystemEnabled
-        btnToggle.BackgroundColor3 = CONFIG.SystemEnabled
-            and Color3.fromRGB(40, 120, 40)
-            or Color3.fromRGB(120, 40, 40)
-        btnToggle.Text = CONFIG.SystemEnabled
-            and "ON — Sistema Ativo"
-            or "OFF — Sistema Desativado"
-        if not CONFIG.SystemEnabled and State.IsLocked then
-            Unlock()
-        end
-    end)
-
-    btnFPS.MouseButton1Click:Connect(function()
-        OptimizeFPS()
-        btnFPS.Text = "✓ FPS Otimizado!"
-        btnFPS.BackgroundColor3 = Color3.fromRGB(40, 100, 40)
-        task.wait(1.5)
-        btnFPS.Text = "⚙ Otimizar FPS"
-        btnFPS.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
-    end)
-
-    btnBF.MouseButton1Click:Connect(function()
-        MiniBlackFlashBtn.Visible = not MiniBlackFlashBtn.Visible
-        btnBF.Text = MiniBlackFlashBtn.Visible
-            and "⚫ Black Flash: ON"
-            or "⚫ Toggle Black Flash"
-    end)
-
-    btnMoveset.MouseButton1Click:Connect(function()
-        UploadMovesetTroll()
-        btnMoveset.Text = "✓ Moveset Enviado!"
-        task.wait(1.5)
-        btnMoveset.Text = "🎭 Moveset Troll"
+        btnToggle.BackgroundColor3 = CONFIG.SystemEnabled and ON or OFF
+        btnToggle.Text = CONFIG.SystemEnabled and "Sistema: ON" or "Sistema: OFF"
+        if not CONFIG.SystemEnabled and State.IsLocked then Unlock() end
     end)
 
     btnMode.MouseButton1Click:Connect(function()
         State.LockMode = State.LockMode == "hard" and "soft" or "hard"
-        btnMode.Text = "Mode: " .. string.upper(State.LockMode)
-
+        btnMode.Text = "Modo: " .. string.upper(State.LockMode)
         if State.IsLocked then
             pcall(function()
                 Camera.CameraType = State.LockMode == "hard"
-                    and Enum.CameraType.Scriptable
-                    or Enum.CameraType.Custom
+                    and Enum.CameraType.Scriptable or Enum.CameraType.Custom
                 UserInputService.MouseBehavior = State.LockMode == "hard"
-                    and Enum.MouseBehavior.LockCenter
-                    or Enum.MouseBehavior.Default
+                    and Enum.MouseBehavior.LockCenter or Enum.MouseBehavior.Default
             end)
         end
     end)
 
-    -- Botão 6: Auto-Lock ao Apanhar (toggle)
     btnAutoLock.MouseButton1Click:Connect(function()
         CONFIG.AutoLockOnHit = not CONFIG.AutoLockOnHit
-        btnAutoLock.Text = CONFIG.AutoLockOnHit
-            and "🎯 Auto-Lock ao Apanhar: ON"
-            or "🎯 Auto-Lock ao Apanhar: OFF"
-        btnAutoLock.BackgroundColor3 = CONFIG.AutoLockOnHit
-            and Color3.fromRGB(40, 110, 90)
-            or Color3.fromRGB(70, 70, 80)
+        btnAutoLock.Text = CONFIG.AutoLockOnHit and "Auto-Lock ao Apanhar: ON" or "Auto-Lock ao Apanhar: OFF"
+        btnAutoLock.BackgroundColor3 = CONFIG.AutoLockOnHit and ON or OFF
     end)
 
-    -- Botão 7: Side Dash (mostra/esconde os botões de dash)
+    -- Câmera
+    btnFPS.MouseButton1Click:Connect(function()
+        OptimizeFPS()
+        btnFPS.Text = "FPS Otimizado!"
+        task.wait(1.5)
+        btnFPS.Text = "Otimizar FPS"
+    end)
+
+    -- Dash
     btnDash.MouseButton1Click:Connect(function()
         local vis = not dashLeftBtn.Visible
         dashLeftBtn.Visible = vis
         dashRightBtn.Visible = vis
-        btnDash.Text = vis and "💨 Side Dash: ON" or "💨 Side Dash: OFF"
-        btnDash.BackgroundColor3 = vis
-            and Color3.fromRGB(25, 60, 90)
-            or Color3.fromRGB(70, 70, 80)
+        btnDash.Text = vis and "Side Dash: ON" or "Side Dash: OFF"
+        btnDash.BackgroundColor3 = vis and ON or OFF
     end)
 
-    -- Botão 8: Resetar posições de todos os botões
+    -- Black Flash
+    btnAutoBF.MouseButton1Click:Connect(function()
+        State.AutoBF = not State.AutoBF
+        btnAutoBF.Text = State.AutoBF and "Auto Black Flash: ON" or "Auto Black Flash: OFF"
+        btnAutoBF.BackgroundColor3 = State.AutoBF and ON or OFF
+    end)
+
+    btnBF.MouseButton1Click:Connect(function()
+        MiniBlackFlashBtn.Visible = not MiniBlackFlashBtn.Visible
+        btnBF.Text = MiniBlackFlashBtn.Visible and "Esconder botão B.Flash" or "Mostrar botão B.Flash"
+    end)
+
+    -- Dodge
+    btnDodgeChar.MouseButton1Click:Connect(function()
+        local order = { "auto", "haruta", "charles" }
+        local i = 1
+        for k, v in ipairs(order) do if v == State.DodgeChar then i = k break end end
+        State.DodgeChar = order[(i % #order) + 1]
+        btnDodgeChar.Text = "Char: " .. dodgeLabels[State.DodgeChar]
+    end)
+
+    btnAutoDodge.MouseButton1Click:Connect(function()
+        CONFIG.AutoDodge = not CONFIG.AutoDodge
+        btnAutoDodge.Text = CONFIG.AutoDodge and "Auto Dodge: ON" or "Auto Dodge: OFF"
+        btnAutoDodge.BackgroundColor3 = CONFIG.AutoDodge and ON or OFF
+    end)
+
+    -- Extra
+    btnMoveset.MouseButton1Click:Connect(function()
+        UploadMovesetTroll()
+        btnMoveset.Text = "Moveset Enviado!"
+        task.wait(1.5)
+        btnMoveset.Text = "Moveset Troll"
+    end)
+
     btnReset.MouseButton1Click:Connect(function()
         State.SavedButtonPos = nil
         State.SavedBFPos = nil
@@ -2035,41 +2377,18 @@ local function BuildUI()
         hubFrame.Position = CONFIG.DefaultHubPos
         dashLeftBtn.Position = CONFIG.DefaultDashLeftPos
         dashRightBtn.Position = CONFIG.DefaultDashRightPos
-        btnReset.Text = "✓ Posições Resetadas!"
+        btnReset.Text = "Posições Resetadas!"
         task.wait(1.2)
-        btnReset.Text = "↺ Resetar Posições"
+        btnReset.Text = "Resetar Posições"
     end)
 
-    -- Black Flash action
-    local bfCooldown = false
+    -- Botão flutuante B.Flash → dispara a chain inteligente (dash + combo)
     MiniBlackFlashBtn.MouseButton1Click:Connect(function()
-        if bfCooldown then return end
-        bfCooldown = true
-
-        -- Visual feedback
-        MiniBlackFlashBtn.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
-        MiniBlackFlashBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-
-        local function Press3()
-            pcall(function()
-                if VirtualInput then
-                    VirtualInput:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
-                    task.wait(0.05)
-                    VirtualInput:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
-                end
-            end)
-        end
-
-        Press3()
-        task.wait(0.28)
-        Press3()
-
-        -- Reset visual
-        MiniBlackFlashBtn.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
-        MiniBlackFlashBtn.TextColor3 = Color3.fromRGB(255, 0, 0)
-
-        task.wait(0.15) -- mini cooldown anti-spam
-        bfCooldown = false
+        MiniBlackFlashBtn.BackgroundColor3 = Color3.fromRGB(60, 0, 0)
+        AutoBlackFlash()
+        task.delay(0.2, function()
+            MiniBlackFlashBtn.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+        end)
     end)
 
     -- Lock button click
@@ -2182,7 +2501,7 @@ UserInputService.InputBegan:Connect(function(input, processed)
         end
         -- Sincroniza UI
         if UI.BtnMode then
-            UI.BtnMode.Text = "Mode: " .. string.upper(State.LockMode)
+            UI.BtnMode.Text = "Modo: " .. string.upper(State.LockMode)
         end
 
     elseif key == CONFIG.NextTargetKey then
@@ -2196,6 +2515,9 @@ UserInputService.InputBegan:Connect(function(input, processed)
 
     elseif key == CONFIG.DashRightKey then
         SideDash(1)
+
+    elseif key == CONFIG.BFAutoKey then
+        AutoBlackFlash()
     end
 end)
 
@@ -2233,19 +2555,24 @@ local function Init()
         end
     end))
 
+    -- Auto Dodge: liga os listeners de animação dos inimigos
+    SetupAutoDodge()
+
+    -- Auto Black Flash em loop (só age quando State.AutoBF; cooldown/guard internos)
+    Conn("AutoBFLoop", RunService.Heartbeat:Connect(function()
+        if State.AutoBF then AutoBlackFlash() end
+    end))
+
     -- Main render loop
     RunService.RenderStepped:Connect(UpdateCamera)
 
     print("══════════════════════════════════════════════════")
     print("  LOCK-ON SYSTEM v6.2 — COMBAT FIXES")
-    print("  ✦ Menu com botão de abrir/fechar (☰)")
-    print("  ✦ Botões e menu não saem mais da tela (clamp + reset)")
-    print("  ✦ Câmera no lock estável (anti-teleporte/overshoot)")
-    print("  ✦ Fix: câmera não trava mais no chão ao morrer")
-    print("  ✦ Auto-lock ao apanhar agora é toggle no menu")
+    print("  ✦ Menu em abas (preto/cinza) — abre/fecha no ☰")
+    print("  ✦ Side Dash (Z/C) — contorna pras costas do alvo")
+    print("  ✦ Auto Black Flash (V/botão) — dash pras costas + combo do 3")
+    print("  ✦ Auto Dodge (Haruta=M1 / Charles=block F) — aba Dodge")
     print("  ✦ 2v1: seta aponta o segundo atacante")
-    print("  ✦ Auto-lock foca em quem te atacou (não na frente)")
-    print("  ✦ Side Dash (Z/C ou botões) — contorna pras costas do alvo")
     print("══════════════════════════════════════════════════")
 end
 
