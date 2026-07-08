@@ -33,6 +33,7 @@ local RunService         = game:GetService("RunService")
 local UserInputService   = game:GetService("UserInputService")
 local Lighting           = game:GetService("Lighting")
 local TweenService       = game:GetService("TweenService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 
 local VirtualInput
 pcall(function() VirtualInput = game:GetService("VirtualInputManager") end)
@@ -164,8 +165,23 @@ local CONFIG = {
     M1Windup             = 0.22,  -- impacto do M1 (~0.20–0.23s)
     M1FinisherWindup     = 0.32,  -- impacto do finalizador (~0.28–0.35s)
     ReactionLead         = 0.04,  -- antecipa a reação (ping/frames)
-    DodgeRange           = 14,    -- distância máxima do inimigo pra reagir
+    DodgeRange           = 13,    -- distância máxima do inimigo pra reagir (M1 ~8x8x8 + fechada no windup)
     DodgeCooldown        = 0.4,   -- cooldown entre esquivas
+    DodgeDebug           = false, -- imprime no console o que detecta/dispara (pra calibrar)
+    -- Fallback: caminhos comuns dos RemoteEvents sob ReplicatedStorage.
+    -- Usado se a captura automática (hook) não aprender o remote do jogo.
+    M1RemotePaths        = {
+        { "RemoteEvents", "Combat", "M1" },
+        { "Remotes", "Combat", "M1" },
+        { "Combat", "M1" },
+    },
+    BlockRemotePaths     = {
+        { "RemoteEvents", "Combat", "Block" },
+        { "RemoteEvents", "Combat", "ToggleBlock" },
+        { "Remotes", "Combat", "Block" },
+        { "Remotes", "Combat", "ToggleBlock" },
+        { "Combat", "Block" },
+    },
 
     -- ▸ Tema do menu (preto/cinza)
     ThemeBg              = Color3.fromRGB(18, 18, 22),
@@ -265,6 +281,8 @@ local State = {
     DodgeChar            = "auto",   -- "auto" | "haruta" | "charles"
     DodgeLastTime        = 0,
     DodgePending         = false,
+    M1Action             = nil,     -- remote aprendido do M1 {remote, method, args}
+    BlockAction          = nil,     -- remote aprendido do block
 }
 
 -- ══════════════════════════════════════════════════════
@@ -1516,13 +1534,108 @@ local function GetDodgeChar()
     return found
 end
 
-local function TriggerDodge()
+-- Resolve um RemoteEvent/Function por uma lista de caminhos sob ReplicatedStorage
+local function ResolveRemote(paths)
+    if not paths then return nil end
+    for _, path in ipairs(paths) do
+        local node = ReplicatedStorage
+        for _, name in ipairs(path) do
+            node = node and node:FindFirstChild(name)
+        end
+        if node and (node:IsA("RemoteEvent") or node:IsA("RemoteFunction")) then
+            return node
+        end
+    end
+    return nil
+end
+
+-- Dispara em camadas: 1º remote aprendido, 2º remote por caminho comum.
+-- Retorna a via usada (string) ou nil se nada disparou.
+local function FireAction(learned, paths)
+    if learned and learned.remote and learned.remote.Parent then
+        local ok = pcall(function()
+            local args = learned.args
+            if args then
+                learned.remote:FireServer(table.unpack(args, 1, args.n))
+            else
+                learned.remote:FireServer()
+            end
+        end)
+        if ok then return "aprendido" end
+    end
+    local r = ResolveRemote(paths)
+    if r then
+        if pcall(function() r:FireServer() end) then return "caminho" end
+    end
+    return nil
+end
+
+-- Vira o personagem pro atacante (o block/perfect block é frontal)
+local function AutoFaceAttacker(enemyRoot)
+    local r = State.Root
+    if not r or not enemyRoot or not enemyRoot.Parent then return end
+    local look = enemyRoot.Position - r.Position
+    look = Vector3.new(look.X, 0, look.Z)
+    if look.Magnitude > 0.1 then
+        pcall(function()
+            r.CFrame = CFrame.lookAt(r.Position, r.Position + look.Unit)
+            State.SmoothedFaceDir = look.Unit
+        end)
+    end
+end
+
+-- ── Captura automática do remote (aprende observando VOCÊ bloquear/socar) ──
+local ArmCapture, ArmExpiry = nil, 0
+local captureInstalled = false
+local function InstallRemoteCapture()
+    if captureInstalled then return end
+    captureInstalled = true
+    pcall(function()
+        if not (hookmetamethod and getnamecallmethod) then
+            if CONFIG.DodgeDebug then warn("[Dodge] executor sem hook — usando só caminhos/tecla") end
+            return
+        end
+        local old
+        old = hookmetamethod(game, "__namecall", function(self, ...)
+            if ArmCapture and tick() < ArmExpiry then
+                local ok, method = pcall(getnamecallmethod)
+                if ok and method == "FireServer" then
+                    local action = { remote = self, method = method, args = table.pack(...) }
+                    if ArmCapture == "m1" then State.M1Action = action else State.BlockAction = action end
+                    if CONFIG.DodgeDebug then
+                        local nm = "?"; pcall(function() nm = self:GetFullName() end)
+                        print("[Dodge] aprendeu " .. ArmCapture .. " → " .. nm)
+                    end
+                    ArmCapture = nil
+                end
+            end
+            return old(self, ...)
+        end)
+    end)
+end
+
+-- Arma a captura conforme o input real do jogador (F = block, LMB = M1)
+local function ArmCaptureFromInput(input, gpe)
+    if gpe then return end
+    if input.KeyCode == CONFIG.BlockKey then
+        ArmCapture, ArmExpiry = "block", tick() + 0.25
+    elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+        ArmCapture, ArmExpiry = "m1", tick() + 0.25
+    end
+end
+
+local function TriggerDodge(enemyRoot)
     local char = GetDodgeChar()
     if not char then return end
+    AutoFaceAttacker(enemyRoot) -- block é frontal: encara o atacante primeiro
     if char == "haruta" then
-        SimulateClick()                              -- M1 = clique esquerdo
+        local via = FireAction(State.M1Action, CONFIG.M1RemotePaths)
+        if not via then SimulateClick(); via = "clique" end
+        if CONFIG.DodgeDebug then print("[Dodge] Haruta M1 via " .. via) end
     elseif char == "charles" then
-        HoldKey(CONFIG.BlockKey, CONFIG.BlockHoldTime) -- perfect block (segura F)
+        local via = FireAction(State.BlockAction, CONFIG.BlockRemotePaths)
+        if not via then HoldKey(CONFIG.BlockKey, CONFIG.BlockHoldTime); via = "tecla F" end
+        if CONFIG.DodgeDebug then print("[Dodge] Charles block via " .. via) end
     end
 end
 
@@ -1549,11 +1662,16 @@ local function OnEnemyAttack(enemyRoot, windup)
     -- inimigo tem que estar virado pra mim (senão o golpe não é em mim)
     if dist > 0.1 and enemyRoot.CFrame.LookVector:Dot(toMe.Unit) < 0.2 then return end
 
+    if CONFIG.DodgeDebug then
+        print(string.format("[Dodge] ataque detectado (dist=%.1f, char=%s, windup=%.2f)",
+            dist, tostring(GetDodgeChar()), windup or CONFIG.M1Windup))
+    end
+
     State.DodgePending = true
     local delay = math.max((windup or CONFIG.M1Windup) - CONFIG.ReactionLead, 0)
     task.delay(delay, function()
         State.DodgeLastTime = tick()
-        TriggerDodge()
+        TriggerDodge(enemyRoot)
         task.delay(CONFIG.DodgeCooldown, function() State.DodgePending = false end)
     end)
 end
@@ -1591,6 +1709,10 @@ local function BindEnemyAnimator(player)
 end
 
 local function SetupAutoDodge()
+    -- Aprende o remote do block/M1 observando você usar (hook) + arma pela sua tecla/clique
+    InstallRemoteCapture()
+    UserInputService.InputBegan:Connect(ArmCaptureFromInput)
+
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer then
             BindEnemyAnimator(p)
@@ -2025,6 +2147,9 @@ local function BuildUI()
     local btnAutoDodge = MakeHubButton(pageDodge,
         CONFIG.AutoDodge and "Auto Dodge: ON" or "Auto Dodge: OFF",
         CONFIG.AutoDodge and ON or OFF)
+    local btnDodgeDebug = MakeHubButton(pageDodge,
+        CONFIG.DodgeDebug and "Debug: ON" or "Debug: OFF",
+        CONFIG.DodgeDebug and ON or OFF)
 
     -- ── Aba Extra ──
     local btnMoveset = MakeHubButton(pageExtra, "Moveset Troll", CONFIG.ThemePanelLight)
@@ -2354,6 +2479,12 @@ local function BuildUI()
         CONFIG.AutoDodge = not CONFIG.AutoDodge
         btnAutoDodge.Text = CONFIG.AutoDodge and "Auto Dodge: ON" or "Auto Dodge: OFF"
         btnAutoDodge.BackgroundColor3 = CONFIG.AutoDodge and ON or OFF
+    end)
+
+    btnDodgeDebug.MouseButton1Click:Connect(function()
+        CONFIG.DodgeDebug = not CONFIG.DodgeDebug
+        btnDodgeDebug.Text = CONFIG.DodgeDebug and "Debug: ON" or "Debug: OFF"
+        btnDodgeDebug.BackgroundColor3 = CONFIG.DodgeDebug and ON or OFF
     end)
 
     -- Extra
