@@ -171,16 +171,20 @@ local CONFIG = {
     -- Fallback: caminhos comuns dos RemoteEvents sob ReplicatedStorage.
     -- Usado se a captura automática (hook) não aprender o remote do jogo.
     M1RemotePaths        = {
+        { "Keybind", "Combat", "M1" },      -- provável (pasta de inputs do jogo)
+        { "Keybind", "Combat", "Attack" },
         { "RemoteEvents", "Combat", "M1" },
         { "Remotes", "Combat", "M1" },
         { "Combat", "M1" },
     },
     BlockRemotePaths     = {
+        { "Keybind", "Combat", "Block" },   -- caminho real achado pelo usuário
         { "RemoteEvents", "Combat", "Block" },
         { "RemoteEvents", "Combat", "ToggleBlock" },
         { "Remotes", "Combat", "Block" },
         { "Remotes", "Combat", "ToggleBlock" },
         { "Combat", "Block" },
+        { "Utils", "Damage", "BlockHit" },  -- último recurso (é registro de hit, não gatilho)
     },
 
     -- ▸ Tema do menu (preto/cinza)
