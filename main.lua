@@ -168,6 +168,9 @@ local CONFIG = {
     DodgeRange           = 13,    -- distância máxima do inimigo pra reagir (M1 ~8x8x8 + fechada no windup)
     DodgeCooldown        = 0.4,   -- cooldown entre esquivas
     DodgeDebug           = false, -- imprime no console o que detecta/dispara (pra calibrar)
+    -- Janela de captura após F/clique: alguns jogos disparam o remote só no IMPACTO
+    -- (fim do windup ~0.2-0.35s), não no instante do input — por isso é ampla.
+    CaptureWindow        = 0.9,
     -- Fallback: caminhos comuns dos RemoteEvents sob ReplicatedStorage.
     -- Usado se a captura automática (hook) não aprender o remote do jogo.
     M1RemotePaths        = {
@@ -185,6 +188,8 @@ local CONFIG = {
         { "Remotes", "Combat", "ToggleBlock" },
         { "Combat", "Block" },
         { "Utils", "Damage", "BlockHit" },  -- último recurso (é registro de hit, não gatilho)
+        { "Remotes", "BuildEvent" },        -- achado pelo usuário; nome sugere não ser de combate,
+                                            -- mas fica como último recurso caso seja um dispatcher genérico
     },
 
     -- ▸ Tema do menu (preto/cinza)
@@ -287,6 +292,8 @@ local State = {
     DodgePending         = false,
     M1Action             = nil,     -- remote aprendido do M1 {remote, method, args}
     BlockAction          = nil,     -- remote aprendido do block
+    M1Candidates         = {},      -- todos os FireServer/InvokeServer vistos após o clique (debug)
+    BlockCandidates      = {},      -- idem, após apertar F
 }
 
 -- ══════════════════════════════════════════════════════
@@ -1553,23 +1560,39 @@ local function ResolveRemote(paths)
     return nil
 end
 
--- Dispara em camadas: 1º remote aprendido, 2º remote por caminho comum.
+-- Dispara em camadas: 1º remote aprendido, 2º remote por caminho comum, 3º Attribute comum.
 -- Retorna a via usada (string) ou nil se nada disparou.
-local function FireAction(learned, paths)
+local function FireAction(learned, paths, attrNames)
     if learned and learned.remote and learned.remote.Parent then
         local ok = pcall(function()
             local args = learned.args
-            if args then
-                learned.remote:FireServer(table.unpack(args, 1, args.n))
+            local a = args and { table.unpack(args, 1, args.n) } or {}
+            if learned.method == "InvokeServer" then
+                learned.remote:InvokeServer(table.unpack(a))
             else
-                learned.remote:FireServer()
+                learned.remote:FireServer(table.unpack(a))
             end
         end)
         if ok then return "aprendido" end
     end
     local r = ResolveRemote(paths)
     if r then
-        if pcall(function() r:FireServer() end) then return "caminho" end
+        local ok = pcall(function()
+            if r:IsA("RemoteFunction") then r:InvokeServer() else r:FireServer() end
+        end)
+        if ok then return "caminho" end
+    end
+    -- Último recurso: alguns jogos replicam bloqueio via Attribute (sem remote)
+    if attrNames and LocalPlayer.Character then
+        for _, name in ipairs(attrNames) do
+            local ok = pcall(function()
+                LocalPlayer.Character:SetAttribute(name, true)
+                task.delay(CONFIG.BlockHoldTime, function()
+                    pcall(function() LocalPlayer.Character:SetAttribute(name, false) end)
+                end)
+            end)
+            if ok then return "attribute:" .. name end
+        end
     end
     return nil
 end
@@ -1588,29 +1611,49 @@ local function AutoFaceAttacker(enemyRoot)
     end
 end
 
--- ── Captura automática do remote (aprende observando VOCÊ bloquear/socar) ──
+-- ── Captura automática do remote (aprende/espiona observando VOCÊ bloquear/socar) ──
+-- Descreve args de forma legível pro debug (só primitivos; resto vira o tipo)
+local function DescribeArgs(args)
+    if not args or args.n == 0 then return "()" end
+    local parts = {}
+    for i = 1, args.n do
+        local v = args[i]
+        local t = typeof(v)
+        if t == "string" then parts[#parts+1] = string.format("%q", v)
+        elseif t == "number" or t == "boolean" then parts[#parts+1] = tostring(v)
+        else parts[#parts+1] = "<" .. t .. ">" end
+    end
+    return "(" .. table.concat(parts, ", ") .. ")"
+end
+
 local ArmCapture, ArmExpiry = nil, 0
 local captureInstalled = false
+
 local function InstallRemoteCapture()
     if captureInstalled then return end
     captureInstalled = true
     pcall(function()
         if not (hookmetamethod and getnamecallmethod) then
-            if CONFIG.DodgeDebug then warn("[Dodge] executor sem hook — usando só caminhos/tecla") end
+            -- Diagnóstico crítico: mostra sempre, não só com Debug ligado
+            warn("[Dodge] executor sem hookmetamethod/getnamecallmethod — captura automática desativada. Usando apenas caminhos de remote / attribute / tecla.")
             return
         end
         local old
         old = hookmetamethod(game, "__namecall", function(self, ...)
             if ArmCapture and tick() < ArmExpiry then
                 local ok, method = pcall(getnamecallmethod)
-                if ok and method == "FireServer" then
+                if ok and (method == "FireServer" or method == "InvokeServer") then
                     local action = { remote = self, method = method, args = table.pack(...) }
+                    local list = (ArmCapture == "m1") and State.M1Candidates or State.BlockCandidates
+                    list[#list + 1] = action
+                    -- Heurística: guarda o ÚLTIMO capturado como "aprendido" (mais perto do
+                    -- instante real da ação, já que muitos jogos disparam no impacto/soltar, não no clique)
                     if ArmCapture == "m1" then State.M1Action = action else State.BlockAction = action end
                     if CONFIG.DodgeDebug then
                         local nm = "?"; pcall(function() nm = self:GetFullName() end)
-                        print("[Dodge] aprendeu " .. ArmCapture .. " → " .. nm)
+                        print(string.format("[Dodge][spy] %s #%d: %s:%s%s",
+                            ArmCapture, #list, nm, method, DescribeArgs(action.args)))
                     end
-                    ArmCapture = nil
                 end
             end
             return old(self, ...)
@@ -1618,15 +1661,22 @@ local function InstallRemoteCapture()
     end)
 end
 
--- Arma a captura conforme o input real do jogador (F = block, LMB = M1)
+-- Arma a captura conforme o input real do jogador (F = block, LMB = M1).
+-- Janela ampla: alguns jogos disparam o remote no IMPACTO (fim do windup), não no clique.
 local function ArmCaptureFromInput(input, gpe)
     if gpe then return end
     if input.KeyCode == CONFIG.BlockKey then
-        ArmCapture, ArmExpiry = "block", tick() + 0.25
+        ArmCapture, ArmExpiry = "block", tick() + CONFIG.CaptureWindow
+        State.BlockCandidates = {}
+        if CONFIG.DodgeDebug then print("[Dodge][spy] armado: block (F pressionado)") end
     elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-        ArmCapture, ArmExpiry = "m1", tick() + 0.25
+        ArmCapture, ArmExpiry = "m1", tick() + CONFIG.CaptureWindow
+        State.M1Candidates = {}
+        if CONFIG.DodgeDebug then print("[Dodge][spy] armado: m1 (clique esquerdo)") end
     end
 end
+
+local BLOCK_ATTR_NAMES = { "Blocking", "IsBlocking", "Block", "IsBlock" }
 
 local function TriggerDodge(enemyRoot)
     local char = GetDodgeChar()
@@ -1637,7 +1687,7 @@ local function TriggerDodge(enemyRoot)
         if not via then SimulateClick(); via = "clique" end
         if CONFIG.DodgeDebug then print("[Dodge] Haruta M1 via " .. via) end
     elseif char == "charles" then
-        local via = FireAction(State.BlockAction, CONFIG.BlockRemotePaths)
+        local via = FireAction(State.BlockAction, CONFIG.BlockRemotePaths, BLOCK_ATTR_NAMES)
         if not via then HoldKey(CONFIG.BlockKey, CONFIG.BlockHoldTime); via = "tecla F" end
         if CONFIG.DodgeDebug then print("[Dodge] Charles block via " .. via) end
     end
